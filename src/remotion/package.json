@@ -1,0 +1,24 @@
+{
+  "name": "video-editor",
+  "version": "1.0.0",
+  "description": "Automated video editor with subtitles",
+  "scripts": {
+    "dev": "npx remotion studio",
+    "render": "node render.mjs",
+    "build": "node render.mjs"
+  },
+  "dependencies": {
+    "@remotion/captions": "^4.0.460",
+    "@remotion/cli": "^4.0.460",
+    "@remotion/media": "^4.0.460",
+    "@remotion/player": "^4.0.460",
+    "@remotion/studio": "^4.0.460",
+    "remotion": "^4.0.460",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "typescript": "^5.4.5"
+  }
+}

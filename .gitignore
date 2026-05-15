@@ -1,0 +1,36 @@
+# macOS
+.DS_Store
+
+# Environment / secrets
+.env
+.env.*
+
+# Generated graph cache
+src/graphify-out/
+
+# input/output videos (large, user-specific)
+input/*
+output/*
+
+# Pipeline intermediate files
+src/data/*.mp4
+src/data/*.wav
+src/data/audio.json
+src/data/clip_map.json
+src/data/transcript.json
+src/data/edit_plan.json
+src/data/subtitles_words.json
+src/data/concat_list.txt
+
+# Remotion generated files
+src/remotion/node_modules/
+src/remotion/out/
+src/remotion/public/edited.mp4
+src/remotion/public/aislop.mp4
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
