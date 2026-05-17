@@ -10,9 +10,11 @@ import subprocess
 import json
 import sys
 from pathlib import Path
-from config import INPUT_DIR, OUT_DIR, probe
-
-TARGET_W, TARGET_H, TARGET_FPS = 1080, 1920, 30
+from config import (
+    INPUT_DIR, OUT_DIR, probe,
+    VIDEO_W_PX, VIDEO_H_PX, VIDEO_FPS,
+    FFMPEG_X264_FAST_ARGS, FFMPEG_AAC_STEREO_ARGS,
+)
 
 
 def get_rotation(stream: dict) -> int:
@@ -31,14 +33,14 @@ def normalize(video: Path, out: Path) -> float:
 
     # ffmpeg auto-rotates via decoder when rotation metadata is present.
     # We only need to scale to target dimensions — no transpose needed.
-    vf = f"scale={TARGET_W}:{TARGET_H}"
+    vf = f"scale={VIDEO_W_PX}:{VIDEO_H_PX}"
 
     cmd = [
         "ffmpeg", "-y", "-i", str(video),
         "-vf", vf,
-        "-r", str(TARGET_FPS),
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-c:a", "aac", "-ar", "44100", "-ac", "2",
+        "-r", str(VIDEO_FPS),
+        *FFMPEG_X264_FAST_ARGS,
+        *FFMPEG_AAC_STEREO_ARGS,
         str(out)
     ]
     print(f"  normalizing {video.name} (rotation={rotation})...")
@@ -64,7 +66,7 @@ def concatenate(norm_files: list[Path], out: Path):
 
 
 def main():
-    videos = sorted(INPUT_DIR.glob("vid*.mp4"))
+    videos = sorted(INPUT_DIR.glob("*.mp4"))
     if not videos:
         print("ERROR: no videos found in input/")
         sys.exit(1)

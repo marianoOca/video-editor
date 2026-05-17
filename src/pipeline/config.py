@@ -10,6 +10,19 @@ OUTPUT_DIR = SRC_DIR.parent / "output"
 REMOTION_DIR = SRC_DIR / "remotion"
 HYPERFRAMES_PORT = 9847
 
+# --- Video target ---
+VIDEO_W_PX = 1080
+VIDEO_H_PX = 1920
+VIDEO_FPS = 30
+
+# --- ffmpeg encoding fragments ---
+FFMPEG_X264_FAST_ARGS = ["-c:v", "libx264", "-preset", "fast", "-crf", "18"]
+FFMPEG_AAC_STEREO_ARGS = ["-c:a", "aac", "-ar", "44100", "-ac", "2"]
+
+# --- Image overlays ---
+IMAGES_DIR = INPUT_DIR / "images"
+IMAGE_WIDTH_FRAC = 0.35
+
 OUT_DIR.mkdir(exist_ok=True)
 
 

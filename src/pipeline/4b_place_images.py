@@ -19,10 +19,7 @@ import re
 import sys
 import tempfile
 from pathlib import Path
-from config import OUT_DIR, INPUT_DIR, REMOTION_DIR
-
-IMAGES_DIR = INPUT_DIR / "images"
-IMAGE_WIDTH_FRACTION = 0.35  # image width = 35% of frame width
+from config import OUT_DIR, REMOTION_DIR, IMAGES_DIR, IMAGE_WIDTH_FRAC
 
 
 def get_images() -> list[Path]:
@@ -92,12 +89,12 @@ def ask_claude_placement(frame_png: Path, image_name: str) -> tuple[float, float
         f"I want to place an image overlay ({image_name}) on this frame without covering "
         f"the person's face or body.\n\n"
         f"Analyze where the face and body are, then pick the best position for the image overlay.\n"
-        f"The image will be about 35% of the frame width, positioned absolutely.\n\n"
+        f"The image will be about {int(IMAGE_WIDTH_FRAC * 100)}% of the frame width, positioned absolutely.\n\n"
         f"Reply ONLY with valid JSON, no extra text:\n"
         f'{{\"x\": <0.0–1.0>, \"y\": <0.0–1.0>, \"reasoning\": \"<brief>\"}}\n'
         f"Where x=0,y=0 is top-left and x=1,y=1 is bottom-right.\n"
         f"x and y are the top-left corner of the image overlay.\n"
-        f"Keep image fully inside frame (account for 35% width, ~40% height of a square image).\n"
+        f"Keep image fully inside frame (account for {int(IMAGE_WIDTH_FRAC * 100)}% width, ~40% height of a square image).\n"
     )
 
     result = subprocess.run(

@@ -31,16 +31,16 @@ import requests
 
 from config import (
     HYPERFRAMES_PORT,
-    INPUT_DIR,
     OUT_DIR,
     OUTPUT_DIR,
     get_duration,
+    IMAGES_DIR,
+    VIDEO_W_PX,
+    VIDEO_H_PX,
+    VIDEO_FPS,
+    IMAGE_WIDTH_FRAC,
+    FFMPEG_X264_FAST_ARGS,
 )
-
-IMAGES_DIR = INPUT_DIR / "images"
-FRAME_W = 1080
-FRAME_H = 1920
-FPS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -143,14 +143,14 @@ def build_composition_html(
             y_frac = entry.get("y", 0.05)
 
             # Convert 0-1 fractions to pixel positions
-            px_x = int(x_frac * FRAME_W)
-            px_y = int(y_frac * FRAME_H)
-            img_w = int(0.35 * FRAME_W)  # 35% of frame width
+            px_x = int(x_frac * VIDEO_W_PX)
+            px_y = int(y_frac * VIDEO_H_PX)
+            img_w = int(IMAGE_WIDTH_FRAC * VIDEO_W_PX)
 
-            total_frames = int((end_s - start_s) * FPS)
+            total_frames = int((end_s - start_s) * VIDEO_FPS)
             # Ken Burns: drift 3% right + 2% down, zoom 1.0 → 1.12
-            drift_x = int(0.03 * FRAME_W)
-            drift_y = int(0.02 * FRAME_H)
+            drift_x = int(0.03 * VIDEO_W_PX)
+            drift_y = int(0.02 * VIDEO_H_PX)
 
             keyframes = json.dumps([
                 {"frame": 0, "x": px_x, "y": px_y},
@@ -182,7 +182,7 @@ def build_composition_html(
             if not text:
                 continue
 
-            total_frames = int((end_s - start_s) * FPS)
+            total_frames = int((end_s - start_s) * VIDEO_FPS)
             fade_frames = min(9, total_frames // 4)  # ~0.3s fade
 
             # Slide up: start 60px below final position, land at y=1680 (bottom zone)
@@ -224,7 +224,7 @@ def build_composition_html(
     body {{ margin: 0; background: transparent; overflow: hidden; }}
   </style>
 </head>
-<body data-resolution="portrait" data-composition-width="{FRAME_W}" data-composition-height="{FRAME_H}">
+<body data-resolution="portrait" data-composition-width="{VIDEO_W_PX}" data-composition-height="{VIDEO_H_PX}">
 {elements_html}
 </body>
 </html>"""
@@ -240,9 +240,9 @@ def render_composition(html: str, out_webm: Path):
     payload = {
         "input": {"type": "html", "value": html},
         "output": {
-            "width": FRAME_W,
-            "height": FRAME_H,
-            "fps": {"num": FPS, "den": 1},
+            "width": VIDEO_W_PX,
+            "height": VIDEO_H_PX,
+            "fps": {"num": VIDEO_FPS, "den": 1},
             "format": "webm",
             "quality": "high",
         },
@@ -294,7 +294,7 @@ def composite(edited_mp4: Path, overlay_webm: Path, final_mp4: Path):
             "-i", str(overlay_webm),
             "-filter_complex", "[0:v][1:v]overlay=0:0[v]",
             "-map", "[v]", "-map", "0:a",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            *FFMPEG_X264_FAST_ARGS,
             "-c:a", "copy",
             str(final_mp4),
         ],

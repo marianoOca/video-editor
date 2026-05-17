@@ -3,7 +3,7 @@
 ```
 video-editor/
 ├── input/
-│   ├── vid1.mp4, vid2.mp4, …    # raw input videos
+│   ├── *.mp4                    # raw input videos (any name, pipeline picks all *.mp4)
 │   └── images/                  # images to overlay (drop here, pipeline picks them up)
 ├── output/                       # final rendered video (final.mp4)
 ├── CLAUDE.md                     # this file
@@ -87,6 +87,10 @@ python3 run_all.py --from 6
 python3 run_all.py --from 6 --no-lower-thirds
 python3 run_all.py --from 6 --no-images
 ```
+
+## Adding a new video to edit
+
+When user shares a video file: copy it to `input/` (any filename, just `.mp4`), then run pipeline from step 1. Pipeline picks up all `*.mp4` in `input/`. Phone videos with rotation metadata (display matrix -90°) are handled automatically by ffmpeg auto-rotate — no transpose needed.
 
 ## Caption architecture
 

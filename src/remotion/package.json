@@ -1,6 +1,6 @@
 {
   "name": "video-editor",
-  "version": "1.0.0",
+  "version": "0.2.0",
   "description": "Automated video editor with subtitles",
   "scripts": {
     "dev": "npx remotion studio",

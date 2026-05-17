@@ -74,7 +74,8 @@ export const VideoComposition: React.FC<CompositionProps> = ({
       <VideoErrorBoundary src={videoSrc}>
         <Video
           src={staticFile(videoSrc)}
-          style={{ width: "100%", height: "100%", objectFit: "cover" }}
+          style={{ width: "100%", height: "100%" }}
+          objectFit="cover"
         />
       </VideoErrorBoundary>
       <ImageOverlayLayer overlays={imageOverlays ?? []} />

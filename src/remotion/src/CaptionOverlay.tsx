@@ -11,6 +11,17 @@ import { createPortal } from "react-dom";
 const HIGHLIGHT_COLOR = "#FFE033";
 const SHADOW = "0px 3px 8px rgba(0,0,0,0.9)";
 
+// Studio playhead red (Remotion 4.x). Used to find the slider line element and
+// bump its z-index above the injected subtitle bar.
+const PLAYHEAD_RED_RGB = "rgb(240, 44, 0)";
+const PLAYHEAD_Z = "9999";
+
+// Subtitle track bar layout (px).
+const BAR_HEIGHT = 52;
+const HANDLE_W = 8;
+const BLOCK_H = 32;
+const BLOCK_TOP = 10;
+
 const INPUT_STYLE: React.CSSProperties = {
   background: "#1e1e1e",
   border: "1px solid #444",
@@ -196,10 +207,9 @@ type DragHandle = {
 
 const SubtitleTrackBar: React.FC<{
   captions: CaptionSegment[];
-  currentMs: number;
   totalDurationMs: number;
   activeIndex: number;
-}> = ({ captions, currentMs, totalDurationMs, activeIndex }) => {
+}> = ({ captions, totalDurationMs, activeIndex }) => {
   const [container, setContainer] = useState<HTMLElement | null>(null);
   const [localCaptions, setLocalCaptions] = useState<CaptionSegment[]>(captions);
   const [dragging, setDragging] = useState<DragHandle | null>(null);
@@ -213,27 +223,96 @@ const SubtitleTrackBar: React.FC<{
 
   useEffect(() => {
     const parentDoc = window.parent?.document ?? document;
+    const parentWin = window.parent ?? window;
     const existing = parentDoc.getElementById("remotion-subtitle-track");
-    if (existing) parentDoc.body.removeChild(existing);
+    if (existing && existing.parentElement) existing.parentElement.removeChild(existing);
 
     const el = parentDoc.createElement("div");
     el.id = "remotion-subtitle-track";
     Object.assign(el.style, {
-      position: "fixed",
-      bottom: "0",
-      left: "0",
-      right: "0",
-      height: "52px",
-      zIndex: "99998",
+      position: "absolute",
+      top: "0px",
+      left: "0px",
+      width: "0px",
+      height: `${BAR_HEIGHT}px`,
       background: "#0e0e0e",
       borderTop: "1px solid #2a2a2a",
+      padding: "0 16px",
+      boxSizing: "border-box",
       fontFamily: "system-ui, sans-serif",
       userSelect: "none",
+      visibility: "hidden",
     });
-    parentDoc.body.appendChild(el);
     setContainer(el);
+
+    // Locate the <Video> track row in Studio's timeline by its label text.
+    let cachedRow: HTMLElement | null = null;
+    const findVideoTrackRow = (): HTMLElement | null => {
+      if (cachedRow && parentDoc.body.contains(cachedRow)) return cachedRow;
+      const walker = parentDoc.createTreeWalker(parentDoc.body, NodeFilter.SHOW_TEXT);
+      let node: Node | null;
+      while ((node = walker.nextNode())) {
+        const txt = node.textContent ?? "";
+        if (!txt.includes("Composition.tsx")) continue;
+        let p: HTMLElement | null = node.parentElement;
+        while (p && (p.clientHeight < 30 || p.clientWidth < 100)) p = p.parentElement;
+        if (p && p.clientHeight <= 400) {
+          cachedRow = p;
+          return p;
+        }
+      }
+      return null;
+    };
+
+    // Scrollable timeline content: outer has class `__remotion-horizontal-scrollbar`
+    // (Studio's TimelineScrollable); inner is its first child. Mounting the bar
+    // inside inner makes it scroll horizontally with the waveform.
+    const findScrollable = (): { outer: HTMLElement; inner: HTMLElement } | null => {
+      const outer = parentDoc.querySelector<HTMLElement>(".__remotion-horizontal-scrollbar");
+      const inner = outer?.firstElementChild;
+      if (!outer || !(inner instanceof HTMLElement)) return null;
+      return { outer, inner };
+    };
+
+    let raf = 0;
+    const tick = () => {
+      const row = findVideoTrackRow();
+      const sc = findScrollable();
+      // Bump Studio's playhead line z-index so it paints above the bar.
+      const playheadLine = parentDoc.querySelector<HTMLElement>(
+        `[style*="${PLAYHEAD_RED_RGB}"]`
+      );
+      if (playheadLine && playheadLine.style.zIndex !== PLAYHEAD_Z) {
+        playheadLine.style.zIndex = PLAYHEAD_Z;
+      }
+      if (row && sc) {
+        if (el.parentElement !== sc.inner) {
+          sc.inner.insertBefore(el, sc.inner.firstChild);
+        }
+        const r = row.getBoundingClientRect();
+        const ir = sc.inner.getBoundingClientRect();
+        // Use widest child of inner so bar matches actual timeline content width
+        // (TimelineDragHandler stretches to 100*zoom% which equals waveform width).
+        let widest = sc.inner.clientWidth;
+        for (const c of Array.from(sc.inner.children)) {
+          if (c === el) continue;
+          if (c instanceof HTMLElement) widest = Math.max(widest, c.scrollWidth, c.clientWidth);
+        }
+        const w = Math.max(sc.outer.scrollWidth, sc.inner.scrollWidth, widest);
+        el.style.top = `${Math.round(r.bottom - ir.top)}px`;
+        el.style.left = "0px";
+        el.style.width = `${w}px`;
+        el.style.visibility = "visible";
+      } else {
+        el.style.visibility = "hidden";
+      }
+      raf = parentWin.requestAnimationFrame(tick);
+    };
+    raf = parentWin.requestAnimationFrame(tick);
+
     return () => {
-      if (parentDoc.body.contains(el)) parentDoc.body.removeChild(el);
+      parentWin.cancelAnimationFrame(raf);
+      if (el.parentElement) el.parentElement.removeChild(el);
     };
   }, []);
 
@@ -299,32 +378,27 @@ const SubtitleTrackBar: React.FC<{
 
   if (!container || totalDurationMs <= 0) return null;
 
-  const HANDLE_W = 8;
-  const BLOCK_H = 32;
-  const BLOCK_TOP = 10;
-
   const ui = (
     <div
       ref={trackRef}
       style={{ position: "relative", width: "100%", height: "100%", overflow: "hidden" }}
     >
-      {/* Playhead */}
-      <div
-        style={{
-          position: "absolute",
-          top: 0,
-          bottom: 0,
-          left: `${(currentMs / totalDurationMs) * 100}%`,
-          width: 2,
-          background: HIGHLIGHT_COLOR,
-          zIndex: 10,
-          pointerEvents: "none",
-        }}
-      />
-
       {localCaptions.map((seg, i) => {
+        if (seg.endMs <= seg.startMs) return null;
+        // Stretch visual end to next visible segment's start so the bar has
+        // No black gaps: extend chip until next caption that starts strictly after.
+        let visualEnd = seg.endMs;
+        for (let j = i + 1; j < localCaptions.length; j++) {
+          const next = localCaptions[j];
+          if (next.endMs <= next.startMs) continue;
+          if (next.startMs > seg.startMs) {
+            visualEnd = Math.max(visualEnd, next.startMs);
+            break;
+          }
+        }
+        if (visualEnd <= seg.startMs) visualEnd = seg.startMs + 100;
         const leftPct = (seg.startMs / totalDurationMs) * 100;
-        const widthPct = ((seg.endMs - seg.startMs) / totalDurationMs) * 100;
+        const widthPct = ((visualEnd - seg.startMs) / totalDurationMs) * 100;
         const isActive = i === activeIndex;
         const isDraggingThis = dragging?.segIndex === i;
 
@@ -335,6 +409,7 @@ const SubtitleTrackBar: React.FC<{
               position: "absolute",
               left: `${leftPct}%`,
               width: `${widthPct}%`,
+              minWidth: 4,
               top: BLOCK_TOP,
               height: BLOCK_H,
             }}
@@ -539,7 +614,6 @@ export const CaptionOverlay: React.FC<{ captions: CaptionSegment[] }> = ({
       {isStudio && (
         <SubtitleTrackBar
           captions={captions}
-          currentMs={currentMs}
           totalDurationMs={totalDurationMs}
           activeIndex={activeIndex}
         />

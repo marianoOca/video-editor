@@ -14,9 +14,10 @@ import sys
 import argparse
 import shutil
 from pathlib import Path
-from config import OUT_DIR, OUTPUT_DIR, REMOTION_DIR
-
-FPS = 30
+from config import (
+    OUT_DIR, OUTPUT_DIR, REMOTION_DIR,
+    VIDEO_FPS, FFMPEG_AAC_STEREO_ARGS,
+)
 
 
 def cut_video(combined: Path, keep: list[dict], out: Path):
@@ -41,13 +42,13 @@ def cut_video(combined: Path, keep: list[dict], out: Path):
         "-c:v", "libx264", "-profile:v", "baseline", "-level", "3.1",
         "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
-        "-c:a", "aac", "-ar", "44100", "-ac", "2",
+        *FFMPEG_AAC_STEREO_ARGS,
         str(out)
     ]
     subprocess.run(cmd, check=True, stderr=subprocess.DEVNULL)
 
 
-def seconds_to_frame(seconds: float, fps: int = FPS) -> int:
+def seconds_to_frame(seconds: float, fps: int = VIDEO_FPS) -> int:
     return int(seconds * fps)
 
 
@@ -90,8 +91,12 @@ def build_subtitles(transcript: dict, keep: list[dict]) -> list[dict]:
     return subtitles
 
 
+def frames_to_ms(frames: int, fps: int = VIDEO_FPS) -> int:
+    return int(frames * 1000 / fps)
+
+
 def update_remotion(edited_video: Path, subtitles: list[dict], duration_frames: int):
-    """Copy edited video to Remotion public/ and update Root.tsx props."""
+    """Copy edited video to Remotion public/ and rewrite Root.tsx with correct props."""
     public_dir = REMOTION_DIR / "public"
     public_dir.mkdir(exist_ok=True)
 
@@ -99,38 +104,60 @@ def update_remotion(edited_video: Path, subtitles: list[dict], duration_frames: 
     shutil.copy2(edited_video, dest)
     print(f"  copied edited video → src/remotion/public/edited.mp4")
 
-    root_path = REMOTION_DIR / "src" / "Root.tsx"
-    content = root_path.read_text()
-    content = re.sub(r"durationInFrames=\{[^}]+\}", f"durationInFrames={{{duration_frames}}}", content)
-    content = re.sub(r'"videoSrc":\s*"[^"]*"', '"videoSrc": "edited.mp4"', content)
-    root_path.write_text(content)
+    # Convert subtitles from frames to ms (format expected by CaptionOverlay)
+    captions = [
+        {
+            "startMs": frames_to_ms(s["start"]),
+            "endMs":   frames_to_ms(s["end"]),
+            "text":    s["text"].strip(),
+        }
+        for s in subtitles
+    ]
 
-    subs_path = REMOTION_DIR / "src" / "subtitles.json"
-    with open(subs_path, "w", encoding="utf-8") as f:
-        json.dump(subtitles, f, indent=2, ensure_ascii=False)
-
-    # Inject image overlays into Root.tsx defaultProps if image_plan.json exists
+    # Load image overlays if available
+    image_overlays = []
     image_plan_path = OUT_DIR / "image_plan.json"
     if image_plan_path.exists():
         with open(image_plan_path, encoding="utf-8") as f:
-            image_plan = json.load(f)
-        if image_plan:
-            image_overlays_json = json.dumps(image_plan)
-            content = root_path.read_text()
-            if '"imageOverlays":' in content:
-                content = re.sub(
-                    r'"imageOverlays":\s*\[[^\]]*\]',
-                    f'"imageOverlays": {image_overlays_json}',
-                    content,
-                )
-            else:
-                content = re.sub(
-                    r'(defaultProps=\{\{[^}]*"videoSrc":\s*"[^"]*")',
-                    rf'\1, "imageOverlays": {image_overlays_json}',
-                    content,
-                )
-            root_path.write_text(content)
-            print(f"  injected {len(image_plan)} image overlay(s) into Root.tsx defaultProps")
+            image_overlays = json.load(f)
+        if image_overlays:
+            print(f"  injected {len(image_overlays)} image overlay(s) into Root.tsx defaultProps")
+
+    # Build defaultProps as plain dict → serialize to JSON → embed in JSX
+    default_props = {
+        "videoSrc": "edited.mp4",
+        "captions": captions,
+        "imageOverlays": image_overlays,
+    }
+    props_json = json.dumps(default_props, ensure_ascii=False)
+
+    # Rewrite Root.tsx from scratch (avoids fragile regex over JSX)
+    root_tsx = f"""import {{ Composition }} from "remotion";
+import {{ VideoComposition }} from "./Composition";
+import {{ compositionSchema }} from "./schema";
+
+export const RemotionRoot: React.FC = () => {{
+  return (
+    <Composition
+      id="VideoEditor"
+      component={{VideoComposition}}
+      durationInFrames={{{duration_frames}}}
+      fps={{30}}
+      width={{608}}
+      height={{1080}}
+      schema={{compositionSchema}}
+      defaultProps={{{props_json}}}
+    />
+  );
+}};
+"""
+    root_path = REMOTION_DIR / "src" / "Root.tsx"
+    root_path.write_text(root_tsx, encoding="utf-8")
+
+    # Also write subtitles.json (legacy static import, kept for compatibility)
+    subs_path = REMOTION_DIR / "src" / "subtitles.json"
+    with open(subs_path, "w", encoding="utf-8") as f:
+        json.dump(subtitles, f, indent=2, ensure_ascii=False)
 
     print(f"  updated Root.tsx ({duration_frames} frames) and subtitles.json ({len(subtitles)} entries)")
 
@@ -155,7 +182,7 @@ def main():
     cut_video(combined, keep, edited)
 
     final_duration = plan["final_duration"]
-    duration_frames = int(final_duration * FPS)
+    duration_frames = int(final_duration * VIDEO_FPS)
     subtitles = build_subtitles(plan["transcript"], keep)
 
     update_remotion(edited, subtitles, duration_frames)
