@@ -28,6 +28,31 @@ src/remotion/out/
 src/remotion/public/edited.mp4
 src/remotion/public/aislop.mp4
 
+# Pipeline-generated image overlays
+src/remotion/public/images/
+
+# Agendia composition (standalone client project — source + media)
+src/remotion/src/agendia/
+src/remotion/public/agendia/
+
+# Caro composition (standalone birthday project — source + media)
+src/remotion/src/caro/
+src/remotion/public/caro/
+
+# Additional pipeline intermediate formats
+src/data/*.webm
+src/data/*.mov
+
+# Output — all video formats
+output/*.webm
+output/*.mov
+
+# Claude Code worktrees (transient, not project content)
+.claude/worktrees/
+
+# Brand resources (client logos — not for public repo)
+resources/
+
 # Python
 __pycache__/
 *.pyc

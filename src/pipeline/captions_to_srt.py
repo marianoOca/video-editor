@@ -18,7 +18,12 @@ def main():
     with open(CAPTIONS_JSON, encoding="utf-8") as f:
         words = json.load(f)
 
+    if not words:
+        print("⚠️  captions.json is empty — nothing to convert.")
+        return
+
     lines = []
+    # Python slice returns fewer elements for the last group — trailing remainder handled implicitly.
     for i in range(0, len(words), WORDS_PER_LINE):
         group = words[i : i + WORDS_PER_LINE]
         lines.append({

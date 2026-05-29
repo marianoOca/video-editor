@@ -1,132 +1,835 @@
 [
   {
-    "start": 12,
-    "end": 172,
-    "text": "Si sos dueño de negocio, esto es para vos. Todos sabemos que la guía se va a llevar puesta al mercado ¿Por qué?"
+    "start": 1,
+    "end": 27,
+    "text": "¿Cómo se ve",
+    "words": [
+      {
+        "start": 1,
+        "end": 24
+      },
+      {
+        "start": 24,
+        "end": 26
+      },
+      {
+        "start": 26,
+        "end": 27
+      }
+    ]
   },
   {
-    "start": 181,
-    "end": 196,
-    "text": "¿Por qué es como la internet? Había una época donde nadie sabía..."
+    "start": 28,
+    "end": 39,
+    "text": "el multitasking en",
+    "words": [
+      {
+        "start": 28,
+        "end": 29
+      },
+      {
+        "start": 30,
+        "end": 37
+      },
+      {
+        "start": 38,
+        "end": 39
+      }
+    ]
   },
   {
-    "start": 401,
-    "end": 401,
-    "text": "Había una época donde nadie tenía una computadora en el bolsillo de su pantalón."
+    "start": 40,
+    "end": 50,
+    "text": "la era de",
+    "words": [
+      {
+        "start": 40,
+        "end": 43
+      },
+      {
+        "start": 44,
+        "end": 46
+      },
+      {
+        "start": 47,
+        "end": 50
+      }
+    ]
   },
   {
-    "start": 406,
-    "end": 406,
-    "text": "Ni hablar de..."
+    "start": 51,
+    "end": 71,
+    "text": "la IA? Acá",
+    "words": [
+      {
+        "start": 51,
+        "end": 52
+      },
+      {
+        "start": 53,
+        "end": 59
+      },
+      {
+        "start": 68,
+        "end": 71
+      }
+    ]
   },
   {
-    "start": 406,
-    "end": 591,
-    "text": "Y hoy es impensado no tener una cuenta de Instagram, una página web o tu ubicación marcada en Google Maps."
+    "start": 73,
+    "end": 82,
+    "text": "tenemos la",
+    "words": [
+      {
+        "start": 73,
+        "end": 79
+      },
+      {
+        "start": 81,
+        "end": 82
+      }
+    ]
   },
   {
-    "start": 596,
-    "end": 689,
-    "text": "Y el mercado es como la selección natural en la jungla de concreto."
+    "start": 84,
+    "end": 107,
+    "text": "configuración de un",
+    "words": [
+      {
+        "start": 84,
+        "end": 100
+      },
+      {
+        "start": 103,
+        "end": 104
+      },
+      {
+        "start": 106,
+        "end": 107
+      }
+    ]
   },
   {
-    "start": 700,
-    "end": 784,
-    "text": "¿Dónde te adaptas si sobrevivís o salís del juego?"
+    "start": 108,
+    "end": 130,
+    "text": "sistema que edita",
+    "words": [
+      {
+        "start": 108,
+        "end": 116
+      },
+      {
+        "start": 117,
+        "end": 119
+      },
+      {
+        "start": 122,
+        "end": 130
+      }
+    ]
   },
   {
-    "start": 794,
-    "end": 865,
-    "text": "¿Y por qué esto te importa a vos en este momento?"
+    "start": 133,
+    "end": 145,
+    "text": "videos en",
+    "words": [
+      {
+        "start": 133,
+        "end": 142
+      },
+      {
+        "start": 142,
+        "end": 145
+      }
+    ]
   },
   {
-    "start": 871,
-    "end": 944,
-    "text": "¿Y por qué te estoy hablando de esto ahora?"
+    "start": 147,
+    "end": 167,
+    "text": "automático. Ahora",
+    "words": [
+      {
+        "start": 147,
+        "end": 162
+      },
+      {
+        "start": 163,
+        "end": 167
+      }
+    ]
   },
   {
-    "start": 955,
-    "end": 1042,
-    "text": "Porque yo soy mariano, licenciado en ciencias de la computación"
+    "start": 168,
+    "end": 178,
+    "text": "van a ver",
+    "words": [
+      {
+        "start": 168,
+        "end": 172
+      },
+      {
+        "start": 173,
+        "end": 173
+      },
+      {
+        "start": 174,
+        "end": 178
+      }
+    ]
   },
   {
-    "start": 1042,
-    "end": 1078,
-    "text": "por la Universidad de Buenos Aires."
+    "start": 179,
+    "end": 189,
+    "text": "para qué lo",
+    "words": [
+      {
+        "start": 179,
+        "end": 183
+      },
+      {
+        "start": 184,
+        "end": 186
+      },
+      {
+        "start": 186,
+        "end": 189
+      }
+    ]
   },
   {
-    "start": 1153,
-    "end": 1153,
-    "text": "Y en este momento estoy seleccionando un puñado de negocios"
+    "start": 190,
+    "end": 202,
+    "text": "vamos a usar.",
+    "words": [
+      {
+        "start": 190,
+        "end": 195
+      },
+      {
+        "start": 195,
+        "end": 196
+      },
+      {
+        "start": 196,
+        "end": 202
+      }
+    ]
   },
   {
-    "start": 1153,
-    "end": 1211,
-    "text": "para hacerles automatizaciones"
+    "start": 208,
+    "end": 223,
+    "text": "Acá tengo la",
+    "words": [
+      {
+        "start": 208,
+        "end": 213
+      },
+      {
+        "start": 215,
+        "end": 219
+      },
+      {
+        "start": 222,
+        "end": 223
+      }
+    ]
   },
   {
-    "start": 1221,
-    "end": 1368,
-    "text": "para generar mi primer porfolio de productos de automatización para negocios."
+    "start": 226,
+    "end": 250,
+    "text": "demo de un",
+    "words": [
+      {
+        "start": 226,
+        "end": 235
+      },
+      {
+        "start": 235,
+        "end": 237
+      },
+      {
+        "start": 248,
+        "end": 250
+      }
+    ]
   },
   {
-    "start": 1373,
-    "end": 1373,
-    "text": "Y con el objetivo..."
+    "start": 253,
+    "end": 273,
+    "text": "chatbot que le",
+    "words": [
+      {
+        "start": 253,
+        "end": 262
+      },
+      {
+        "start": 267,
+        "end": 270
+      },
+      {
+        "start": 272,
+        "end": 273
+      }
+    ]
   },
   {
-    "start": 1373,
-    "end": 1438,
-    "text": "Y con el objetivo de enriquecer"
+    "start": 276,
+    "end": 303,
+    "text": "responde consultas",
+    "words": [
+      {
+        "start": 276,
+        "end": 287
+      },
+      {
+        "start": 288,
+        "end": 303
+      }
+    ]
   },
   {
-    "start": 1438,
-    "end": 1538,
-    "text": "mi porfolio de automatizaciones con IAPA de negocios."
+    "start": 306,
+    "end": 330,
+    "text": "muy frecuentes a",
+    "words": [
+      {
+        "start": 306,
+        "end": 309
+      },
+      {
+        "start": 312,
+        "end": 329
+      },
+      {
+        "start": 329,
+        "end": 330
+      }
+    ]
   },
   {
-    "start": 1549,
-    "end": 1563,
-    "text": "Y con el objetivo..."
+    "start": 330,
+    "end": 367,
+    "text": "una cafetería. Y",
+    "words": [
+      {
+        "start": 330,
+        "end": 346
+      },
+      {
+        "start": 348,
+        "end": 366
+      },
+      {
+        "start": 367,
+        "end": 367
+      }
+    ]
   },
   {
-    "start": 1574,
-    "end": 1634,
-    "text": "Estoy seleccionando un puñado de estos"
+    "start": 368,
+    "end": 380,
+    "text": "como ven,",
+    "words": [
+      {
+        "start": 368,
+        "end": 373
+      },
+      {
+        "start": 376,
+        "end": 380
+      }
+    ]
   },
   {
-    "start": 1634,
-    "end": 1649,
-    "text": "a los cuales le voy a brindar"
+    "start": 389,
+    "end": 409,
+    "text": "funciona bastante",
+    "words": [
+      {
+        "start": 389,
+        "end": 399
+      },
+      {
+        "start": 400,
+        "end": 409
+      }
+    ]
   },
   {
-    "start": 1701,
-    "end": 1819,
-    "text": "una automatización con inteligencia artificial completamente gratis."
+    "start": 411,
+    "end": 430,
+    "text": "bien. Tanto para",
+    "words": [
+      {
+        "start": 411,
+        "end": 416
+      },
+      {
+        "start": 419,
+        "end": 425
+      },
+      {
+        "start": 427,
+        "end": 430
+      }
+    ]
   },
   {
-    "start": 1962,
-    "end": 1962,
-    "text": "y querés que primero que nada te asesore"
+    "start": 434,
+    "end": 446,
+    "text": "WhatsApp",
+    "words": [
+      {
+        "start": 434,
+        "end": 446
+      }
+    ]
   },
   {
-    "start": 1962,
-    "end": 2112,
-    "text": "y veamos cuáles de los procesos repetitivos y manuales se pueden automatizar"
+    "start": 453,
+    "end": 481,
+    "text": "como para Instagram.",
+    "words": [
+      {
+        "start": 453,
+        "end": 458
+      },
+      {
+        "start": 460,
+        "end": 466
+      },
+      {
+        "start": 467,
+        "end": 481
+      }
+    ]
   },
   {
-    "start": 2112,
-    "end": 2142,
-    "text": "entre un negocio y segundo,"
+    "start": 480,
+    "end": 500,
+    "text": "Acá tengo dos",
+    "words": [
+      {
+        "start": 480,
+        "end": 489
+      },
+      {
+        "start": 490,
+        "end": 494
+      },
+      {
+        "start": 495,
+        "end": 500
+      }
+    ]
   },
   {
-    "start": 2303,
-    "end": 2303,
-    "text": "Te invito a que me sigas y que me mandes un mensaje."
+    "start": 503,
+    "end": 529,
+    "text": "cosas. Primero tengo",
+    "words": [
+      {
+        "start": 503,
+        "end": 509
+      },
+      {
+        "start": 513,
+        "end": 520
+      },
+      {
+        "start": 523,
+        "end": 529
+      }
+    ]
   },
   {
-    "start": 2311,
-    "end": 2318,
-    "text": "Nos vemos."
+    "start": 532,
+    "end": 562,
+    "text": "esto, que es",
+    "words": [
+      {
+        "start": 532,
+        "end": 539
+      },
+      {
+        "start": 540,
+        "end": 542
+      },
+      {
+        "start": 551,
+        "end": 562
+      }
+    ]
+  },
+  {
+    "start": 571,
+    "end": 600,
+    "text": "la información sobre",
+    "words": [
+      {
+        "start": 571,
+        "end": 572
+      },
+      {
+        "start": 574,
+        "end": 591
+      },
+      {
+        "start": 592,
+        "end": 600
+      }
+    ]
+  },
+  {
+    "start": 601,
+    "end": 616,
+    "text": "el video que",
+    "words": [
+      {
+        "start": 601,
+        "end": 603
+      },
+      {
+        "start": 604,
+        "end": 611
+      },
+      {
+        "start": 614,
+        "end": 616
+      }
+    ]
+  },
+  {
+    "start": 617,
+    "end": 639,
+    "text": "estoy editando.",
+    "words": [
+      {
+        "start": 617,
+        "end": 623
+      },
+      {
+        "start": 624,
+        "end": 639
+      }
+    ]
+  },
+  {
+    "start": 646,
+    "end": 665,
+    "text": "Además de esta",
+    "words": [
+      {
+        "start": 646,
+        "end": 654
+      },
+      {
+        "start": 655,
+        "end": 658
+      },
+      {
+        "start": 660,
+        "end": 665
+      }
+    ]
+  },
+  {
+    "start": 667,
+    "end": 685,
+    "text": "conversación que",
+    "words": [
+      {
+        "start": 667,
+        "end": 683
+      },
+      {
+        "start": 683,
+        "end": 685
+      }
+    ]
+  },
+  {
+    "start": 686,
+    "end": 707,
+    "text": "tengo acá arriba",
+    "words": [
+      {
+        "start": 686,
+        "end": 696
+      },
+      {
+        "start": 696,
+        "end": 699
+      },
+      {
+        "start": 699,
+        "end": 707
+      }
+    ]
+  },
+  {
+    "start": 710,
+    "end": 720,
+    "text": "también,",
+    "words": [
+      {
+        "start": 710,
+        "end": 720
+      }
+    ]
+  },
+  {
+    "start": 729,
+    "end": 754,
+    "text": "que es el",
+    "words": [
+      {
+        "start": 729,
+        "end": 733
+      },
+      {
+        "start": 738,
+        "end": 743
+      },
+      {
+        "start": 752,
+        "end": 754
+      }
+    ]
+  },
+  {
+    "start": 757,
+    "end": 811,
+    "text": "script para hacer",
+    "words": [
+      {
+        "start": 757,
+        "end": 770
+      },
+      {
+        "start": 782,
+        "end": 792
+      },
+      {
+        "start": 794,
+        "end": 811
+      }
+    ]
+  },
+  {
+    "start": 812,
+    "end": 844,
+    "text": "que ChachyPT arme",
+    "words": [
+      {
+        "start": 812,
+        "end": 813
+      },
+      {
+        "start": 814,
+        "end": 829
+      },
+      {
+        "start": 835,
+        "end": 844
+      }
+    ]
+  },
+  {
+    "start": 845,
+    "end": 873,
+    "text": "los reels para",
+    "words": [
+      {
+        "start": 845,
+        "end": 859
+      },
+      {
+        "start": 861,
+        "end": 868
+      },
+      {
+        "start": 869,
+        "end": 873
+      }
+    ]
+  },
+  {
+    "start": 874,
+    "end": 891,
+    "text": "el siguiente post",
+    "words": [
+      {
+        "start": 874,
+        "end": 875
+      },
+      {
+        "start": 876,
+        "end": 884
+      },
+      {
+        "start": 887,
+        "end": 891
+      }
+    ]
+  },
+  {
+    "start": 892,
+    "end": 901,
+    "text": "que voy a",
+    "words": [
+      {
+        "start": 892,
+        "end": 894
+      },
+      {
+        "start": 895,
+        "end": 898
+      },
+      {
+        "start": 898,
+        "end": 899
+      }
+    ]
+  },
+  {
+    "start": 901,
+    "end": 919,
+    "text": "hacer. Así que",
+    "words": [
+      {
+        "start": 901,
+        "end": 907
+      },
+      {
+        "start": 913,
+        "end": 916
+      },
+      {
+        "start": 917,
+        "end": 919
+      }
+    ]
+  },
+  {
+    "start": 921,
+    "end": 934,
+    "text": "nada, si siempre",
+    "words": [
+      {
+        "start": 921,
+        "end": 925
+      },
+      {
+        "start": 925,
+        "end": 928
+      },
+      {
+        "start": 929,
+        "end": 934
+      }
+    ]
+  },
+  {
+    "start": 937,
+    "end": 958,
+    "text": "fuiste una persona",
+    "words": [
+      {
+        "start": 937,
+        "end": 943
+      },
+      {
+        "start": 945,
+        "end": 947
+      },
+      {
+        "start": 949,
+        "end": 958
+      }
+    ]
+  },
+  {
+    "start": 960,
+    "end": 985,
+    "text": "así, medio inquieta",
+    "words": [
+      {
+        "start": 960,
+        "end": 967
+      },
+      {
+        "start": 967,
+        "end": 973
+      },
+      {
+        "start": 975,
+        "end": 985
+      }
+    ]
+  },
+  {
+    "start": 995,
+    "end": 1004,
+    "text": "como yo,",
+    "words": [
+      {
+        "start": 995,
+        "end": 999
+      },
+      {
+        "start": 1000,
+        "end": 1002
+      }
+    ]
+  },
+  {
+    "start": 1009,
+    "end": 1019,
+    "text": "este es tu",
+    "words": [
+      {
+        "start": 1009,
+        "end": 1012
+      },
+      {
+        "start": 1013,
+        "end": 1015
+      },
+      {
+        "start": 1015,
+        "end": 1019
+      }
+    ]
+  },
+  {
+    "start": 1020,
+    "end": 1040,
+    "text": "mejor momento para",
+    "words": [
+      {
+        "start": 1020,
+        "end": 1025
+      },
+      {
+        "start": 1028,
+        "end": 1034
+      },
+      {
+        "start": 1038,
+        "end": 1040
+      }
+    ]
+  },
+  {
+    "start": 1044,
+    "end": 1056,
+    "text": "brillar.",
+    "words": [
+      {
+        "start": 1044,
+        "end": 1056
+      }
+    ]
   }
 ]

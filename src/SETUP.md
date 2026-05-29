@@ -47,7 +47,7 @@ If any are missing:
 If Homebrew is not installed: `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
 
 **Important for macOS:** the system `pip3` is locked by PEP 668. If `pip install` fails with `externally-managed-environment`, use one of these options:
-- Recommended: `pipx install graphifyy` (install pipx first with `brew install pipx`).
+- Recommended: `pipx install graphify` (install pipx first with `brew install pipx`).
 - Quick alternative: add `--break-system-packages` to the end of the pip command.
 
 ---
@@ -126,7 +126,7 @@ After installing, restart the Claude Code session so it loads the new skill. Ver
 ```
 /remotion-best-practices
 ```
-or check that `src/.claude/skills/remotion-best-practices` resolves correctly (not a broken symlink).
+or check that `.claude/skills/remotion-best-practices` resolves correctly (not a broken symlink).
 
 ---
 
@@ -211,10 +211,21 @@ To be clear: this setup gets the **environment** ready. The 4 tasks the user act
 
 | Task | Tool | Status |
 |---|---|---|
-| Subtitles | Whisper (`openai-whisper`) | ✅ Implemented — `2_transcribe.py` |
-| EN→ES translation | Whisper `translate` mode | Use `--lang es` flag |
+| Subtitles | WhisperX (forced alignment) | ✅ Implemented — `2_transcribe.py` |
+| EN→ES translation | WhisperX `translate` mode | Use `--lang es` flag |
 | Cut silences | `ffmpeg silencedetect` | ✅ Implemented — `3_analyze.py` |
 | Cut repetitions | Claude CLI analyzes transcript | ✅ Implemented — `3_analyze.py` |
+| Mode detection (reel vs youtube) | ffprobe on first input video | ✅ Implemented — `1_normalize.py` |
+
+### Install WhisperX (required for step 2)
+
+```bash
+pip3 install whisperx --break-system-packages
+# First run downloads the wav2vec2 alignment model (~1GB) to ~/.cache/torch.
+# Everything runs locally — no audio leaves the machine.
+```
+
+The legacy `openai-whisper` package is no longer used by the pipeline. It does not need to be uninstalled.
 
 ---
 

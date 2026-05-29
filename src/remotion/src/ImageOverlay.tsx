@@ -15,9 +15,8 @@ const FADE_FRAMES = 10;
 const SingleImageOverlay: React.FC<{
   overlay: ImageOverlay;
   index: number;
-  allOverlays: ImageOverlay[];
   durationFrames: number;
-}> = ({ overlay, index, allOverlays, durationFrames }) => {
+}> = ({ overlay, index, durationFrames }) => {
   const frame = useCurrentFrame();
   const { width, height } = useVideoConfig();
   const { isStudio } = getRemotionEnvironment();
@@ -29,9 +28,12 @@ const SingleImageOverlay: React.FC<{
   const left = Math.round(overlay.x * width);
   const top = Math.round(overlay.y * height);
 
+  const halfDur = Math.max(1, Math.floor(durationFrames / 2));
+  const fadeDuration = Math.min(FADE_FRAMES, halfDur);
+  const fadeOutStart = Math.max(fadeDuration + 1, durationFrames - fadeDuration);
   const opacity = interpolate(
     frame,
-    [0, FADE_FRAMES, durationFrames - FADE_FRAMES, durationFrames],
+    [0, fadeDuration, fadeOutStart, durationFrames],
     [0, 1, 1, 0],
     { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
   );
@@ -126,7 +128,7 @@ export const ImageOverlayLayer: React.FC<{ overlays: ImageOverlay[] }> = ({
     <>
       {overlays.map((overlay, index) => {
         const startFrame = Math.round((overlay.timestamp_ms / 1000) * fps);
-        const durationFrames = Math.round((overlay.duration_ms / 1000) * fps);
+        const durationFrames = Math.max(1, Math.round((overlay.duration_ms / 1000) * fps));
         return (
           <Sequence
             key={`${overlay.file}-${index}`}
@@ -137,7 +139,6 @@ export const ImageOverlayLayer: React.FC<{ overlays: ImageOverlay[] }> = ({
             <SingleImageOverlay
               overlay={overlay}
               index={index}
-              allOverlays={overlays}
               durationFrames={durationFrames}
             />
           </Sequence>

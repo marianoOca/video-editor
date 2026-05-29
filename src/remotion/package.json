@@ -10,6 +10,7 @@
   "dependencies": {
     "@remotion/captions": "^4.0.460",
     "@remotion/cli": "^4.0.460",
+    "@remotion/google-fonts": "^4.0.460",
     "@remotion/media": "^4.0.460",
     "@remotion/player": "^4.0.460",
     "@remotion/studio": "^4.0.460",

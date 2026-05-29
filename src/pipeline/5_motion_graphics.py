@@ -20,7 +20,6 @@ Usage:
 
 import argparse
 import json
-import re
 import shutil
 import subprocess
 import sys
@@ -40,6 +39,8 @@ from config import (
     VIDEO_FPS,
     IMAGE_WIDTH_FRAC,
     FFMPEG_X264_FAST_ARGS,
+    call_claude,
+    ms_to_s,
 )
 
 
@@ -96,31 +97,13 @@ def ask_claude_lower_thirds(edit_plan: list[dict]) -> list[dict]:
         '"text": "<main line>", "subtext": "<optional, or empty string>"}]}\n'
     )
 
-    result = subprocess.run(
-        ["claude", "-p", prompt],
-        capture_output=True, text=True, timeout=90,
-    )
-
-    if result.returncode != 0:
-        print(f"  WARNING: claude CLI error: {result.stderr[:200]}")
-        return []
-
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", result.stdout.strip())
-    try:
-        return json.loads(raw).get("lower_thirds", [])
-    except (json.JSONDecodeError, KeyError) as e:
-        print(f"  WARNING: could not parse lower-thirds response: {e}")
-        print(f"  Raw: {raw[:300]}")
-        return []
+    data = call_claude(prompt)
+    return data.get("lower_thirds", []) if data else []
 
 
 # ---------------------------------------------------------------------------
 # Build Hyperframes HTML composition
 # ---------------------------------------------------------------------------
-
-def ms_to_s(ms: int) -> float:
-    return ms / 1000.0
-
 
 def build_composition_html(
     image_plan: list[dict],

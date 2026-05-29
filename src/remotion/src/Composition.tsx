@@ -2,6 +2,7 @@ import { AbsoluteFill, staticFile } from "remotion";
 import { Video } from "@remotion/media";
 import { CaptionOverlay } from "./CaptionOverlay";
 import { ImageOverlayLayer } from "./ImageOverlay";
+import { TitleCardLayer } from "./TitleCard";
 import type { CompositionProps } from "./schema";
 import { Component } from "react";
 
@@ -68,18 +69,20 @@ export const VideoComposition: React.FC<CompositionProps> = ({
   videoSrc,
   imageOverlays,
   captions,
+  titleCards,
 }) => {
   return (
     <AbsoluteFill style={{ background: "black" }}>
       <VideoErrorBoundary src={videoSrc}>
         <Video
           src={staticFile(videoSrc)}
-          style={{ width: "100%", height: "100%" }}
           objectFit="cover"
+          style={{ width: "100%", height: "100%" }}
         />
       </VideoErrorBoundary>
       <ImageOverlayLayer overlays={imageOverlays ?? []} />
       <CaptionOverlay captions={captions ?? []} />
+      <TitleCardLayer titleCards={titleCards ?? []} />
     </AbsoluteFill>
   );
 };

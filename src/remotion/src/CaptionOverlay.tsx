@@ -3,13 +3,51 @@ import {
   useCurrentFrame,
   AbsoluteFill,
   getRemotionEnvironment,
+  delayRender,
+  continueRender,
 } from "remotion";
 import type { CaptionSegment } from "./schema";
 import { useState, useCallback, useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 
+// Studio editor chrome accent (track bar, edit panel) — internal UI, not brand-facing.
 const HIGHLIGHT_COLOR = "#FFE033";
 const SHADOW = "0px 3px 8px rgba(0,0,0,0.9)";
+
+// ── Brand caption styling (@marian.o.ia) ─────────────────────────────────────
+// Rendered subtitle follows the brand system: Outfit Bold uppercase, Cream
+// inactive words with Forest halo, active word in a Cream pill with Deep
+// Forest text + Gold outline ring + subtle scale pop.
+const BRAND_FONT = "Outfit, sans-serif";
+const BRAND_WORD = "#FAF5ED"; // Cream
+const BRAND_FOREST = "#1F3329"; // Deep Forest
+const BRAND_GOLD = "#D4A03A"; // Gold
+// Multi-layer Forest halo so Cream words stay legible on busy video bgs
+const FOREST_HALO =
+  "0px 0px 14px rgba(31,51,41,0.95), 0px 3px 10px rgba(31,51,41,0.85), 0px 0px 4px rgba(31,51,41,1)";
+
+let outfitInjected = false;
+const useOutfitFont = () => {
+  const [handle] = useState(() => delayRender("Loading Outfit caption font"));
+  useEffect(() => {
+    if (outfitInjected) {
+      continueRender(handle);
+      return;
+    }
+    outfitInjected = true;
+    const style = document.createElement("style");
+    style.innerHTML =
+      "@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700&display=swap');";
+    document.head.appendChild(style);
+    Promise.all(
+      ['700 100px "Outfit"', '600 100px "Outfit"'].map((spec) =>
+        (document as any).fonts?.load(spec).catch(() => null)
+      )
+    )
+      .then(() => continueRender(handle))
+      .catch(() => continueRender(handle));
+  }, [handle]);
+};
 
 // Studio playhead red (Remotion 4.x). Used to find the slider line element and
 // bump its z-index above the injected subtitle bar.
@@ -215,6 +253,7 @@ const SubtitleTrackBar: React.FC<{
   const [dragging, setDragging] = useState<DragHandle | null>(null);
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const trackRef = useRef<HTMLDivElement>(null);
+  const updateGenRef = useRef(0);
 
   // Keep localCaptions in sync when captions prop changes (e.g. after a save)
   useEffect(() => {
@@ -354,10 +393,15 @@ const SubtitleTrackBar: React.FC<{
         parentWin.removeEventListener("mousemove", onMove);
         parentWin.removeEventListener("mouseup", onUp);
         setDragging(null);
-        // Persist final state
+        // Persist final state; generation guard prevents stale writes from
+        // concurrent drag-release sequences overwriting a newer update.
+        updateGenRef.current += 1;
+        const gen = updateGenRef.current;
         setLocalCaptions((final) => {
           (async () => {
+            if (gen !== updateGenRef.current) return;
             const { updateDefaultProps } = await import("@remotion/studio");
+            if (gen !== updateGenRef.current) return;
             await updateDefaultProps({
               compositionId: "VideoEditor",
               defaultProps: ({ savedDefaultProps }: { savedDefaultProps: Record<string, unknown> }) => ({
@@ -505,20 +549,32 @@ const CaptionPage: React.FC<{
   isStudio: boolean;
   onSaved: (updated: CaptionSegment[]) => void;
 }> = ({ segment, currentMs, captionIndex, allCaptions, isStudio, onSaved }) => {
-  const { width } = useVideoConfig();
+  const { width, height } = useVideoConfig();
   const [editing, setEditing] = useState(false);
 
-  const fontSize = Math.round(width * 0.066);
-  const paddingH = Math.round(width * 0.026);
-  const paddingBottom = Math.round(width * 0.1);
+  const fontSize = Math.round(width * 0.07);
+  const paddingH = Math.round(width * 0.02);
+  const paddingBottom = Math.round(height * 0.2);
 
-  const WORDS_PER_PAGE = 4;
+  const WORDS_PER_PAGE = 3;
 
   const words = segment.text.trim().split(/\s+/);
-  const msPerWord = (segment.endMs - segment.startMs) / words.length;
-  const activeWordIndex = Math.floor((currentMs - segment.startMs) / msPerWord);
+  const hasWordTimings = segment.words && segment.words.length === words.length;
 
-  const pageStart = Math.floor(activeWordIndex / WORDS_PER_PAGE) * WORDS_PER_PAGE;
+  // Index of last word that has started — drives page navigation
+  const pageWordIndex = (() => {
+    if (hasWordTimings) {
+      let idx = 0;
+      for (let i = 0; i < segment.words!.length; i++) {
+        if (currentMs >= segment.words![i].startMs) idx = i;
+      }
+      return idx;
+    }
+    const msPerWord = (segment.endMs - segment.startMs) / words.length;
+    return Math.min(Math.floor((currentMs - segment.startMs) / msPerWord), words.length - 1);
+  })();
+
+  const pageStart = Math.floor(pageWordIndex / WORDS_PER_PAGE) * WORDS_PER_PAGE;
   const pageWords = words.slice(pageStart, pageStart + WORDS_PER_PAGE);
 
   return (
@@ -534,34 +590,40 @@ const CaptionPage: React.FC<{
       <div
         onClick={isStudio ? () => setEditing(true) : undefined}
         style={{
+          display: "flex",
+          flexWrap: "wrap",
+          justifyContent: "center",
+          alignItems: "center",
+          gap: 14,
           fontSize,
-          fontFamily: "Arial Black, Arial, sans-serif",
-          fontWeight: 900,
-          whiteSpace: "pre-wrap",
-          textAlign: "center",
+          fontFamily: BRAND_FONT,
+          fontWeight: 700,
+          textTransform: "uppercase",
+          letterSpacing: 1.5,
           lineHeight: 1.2,
-          letterSpacing: -0.5,
           cursor: isStudio ? "pointer" : "default",
-          borderRadius: 4,
-          padding: isStudio ? "2px 6px" : 0,
         }}
         title={isStudio ? "Click para editar" : undefined}
       >
         {pageWords.map((word, i) => {
           const globalIndex = pageStart + i;
+          const isActive = globalIndex === pageWordIndex;
           return (
             <span
               key={globalIndex}
               style={{
-                color: globalIndex === activeWordIndex ? HIGHLIGHT_COLOR : "white",
-                textShadow:
-                  globalIndex === activeWordIndex
-                    ? `0px 0px 20px ${HIGHLIGHT_COLOR}88, ${SHADOW}`
-                    : SHADOW,
+                color: isActive ? BRAND_FOREST : BRAND_WORD,
+                background: isActive ? BRAND_WORD : "transparent",
+                padding: "8px 8px",
+                borderRadius: 14,
+                textShadow: isActive ? "none" : FOREST_HALO,
+                boxShadow: isActive
+                  ? `0 10px 24px rgba(31,51,41,0.5), 0 0 0 2px ${BRAND_GOLD}`
+                  : "none",
+                display: "inline-block",
               }}
             >
               {word}
-              {i < pageWords.length - 1 ? " " : ""}
             </span>
           );
         })}
@@ -583,6 +645,7 @@ const CaptionPage: React.FC<{
 export const CaptionOverlay: React.FC<{ captions: CaptionSegment[] }> = ({
   captions: captionsProp,
 }) => {
+  useOutfitFont();
   const frame = useCurrentFrame();
   const { fps, durationInFrames } = useVideoConfig();
   const currentMs = (frame / fps) * 1000;
@@ -595,9 +658,15 @@ export const CaptionOverlay: React.FC<{ captions: CaptionSegment[] }> = ({
     setCaptions(captionsProp);
   }, [captionsProp]);
 
-  const activeIndex = captions.findIndex(
-    (seg) => seg.startMs <= currentMs && seg.endMs > currentMs
-  );
+  // Show caption i from its startMs until the NEXT caption starts (bridges inter-segment gaps)
+  const activeIndex = (() => {
+    for (let i = 0; i < captions.length; i++) {
+      const nextStart =
+        i + 1 < captions.length ? captions[i + 1].startMs : captions[i].endMs;
+      if (captions[i].startMs <= currentMs && currentMs < nextStart) return i;
+    }
+    return -1;
+  })();
 
   return (
     <>

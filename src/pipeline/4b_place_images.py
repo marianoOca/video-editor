@@ -13,13 +13,13 @@ Output: data/image_plan.json
 Usage: python3 4b_place_images.py
 """
 
+import shutil
 import subprocess
 import json
-import re
 import sys
 import tempfile
 from pathlib import Path
-from config import OUT_DIR, REMOTION_DIR, IMAGES_DIR, IMAGE_WIDTH_FRAC
+from config import OUT_DIR, REMOTION_DIR, IMAGES_DIR, IMAGE_WIDTH_FRAC, call_claude
 
 
 def get_images() -> list[Path]:
@@ -52,22 +52,8 @@ def ask_claude_timing(images: list[Path], transcript: dict) -> list[dict]:
         '{"images": [{"file": "<filename>", "timestamp_ms": <int>, "duration_ms": <int>}]}\n'
     )
 
-    result = subprocess.run(
-        ["claude", "-p", prompt],
-        capture_output=True, text=True, timeout=90
-    )
-
-    if result.returncode != 0:
-        print(f"  WARNING: claude CLI error: {result.stderr[:200]}")
-        return []
-
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", result.stdout.strip())
-    try:
-        return json.loads(raw)["images"]
-    except (json.JSONDecodeError, KeyError) as e:
-        print(f"  WARNING: could not parse timing response: {e}")
-        print(f"  Raw: {raw[:300]}")
-        return []
+    data = call_claude(prompt)
+    return data.get("images", []) if data else []
 
 
 def extract_keyframe(video: Path, timestamp_ms: int, out_png: Path):
@@ -97,24 +83,15 @@ def ask_claude_placement(frame_png: Path, image_name: str) -> tuple[float, float
         f"Keep image fully inside frame (account for {int(IMAGE_WIDTH_FRAC * 100)}% width, ~40% height of a square image).\n"
     )
 
-    result = subprocess.run(
-        ["claude", "-p", prompt, "--image", str(frame_png)],
-        capture_output=True, text=True, timeout=60
-    )
-
-    if result.returncode != 0:
-        print(f"  WARNING: claude CLI placement error: {result.stderr[:200]}")
-        # default: top-right corner
+    data = call_claude(prompt, extra_args=["--image", str(frame_png)], timeout=60)
+    if data is None:
         return 0.6, 0.05
-
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", result.stdout.strip())
     try:
-        data = json.loads(raw)
         x = max(0.0, min(0.65, float(data["x"])))  # clamp so image stays in frame
         y = max(0.0, min(0.60, float(data["y"])))
         print(f"    → x={x:.2f}, y={y:.2f} ({data.get('reasoning', '')})")
         return x, y
-    except (json.JSONDecodeError, KeyError, ValueError) as e:
+    except (KeyError, ValueError) as e:
         print(f"  WARNING: could not parse placement response: {e}")
         return 0.6, 0.05
 
@@ -125,7 +102,6 @@ def copy_images_to_public(images: list[Path]):
     dest_dir.mkdir(parents=True, exist_ok=True)
     for img in images:
         dest = dest_dir / img.name
-        import shutil
         shutil.copy2(img, dest)
     print(f"  copied {len(images)} image(s) → remotion/public/images/")
 

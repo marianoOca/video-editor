@@ -11,12 +11,12 @@ import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// Leer videoSrc desde Root.tsx
+// Red videoSrc from Root.tsx
 const rootTsx = readFileSync(resolve(__dirname, "src/Root.tsx"), "utf8");
 const match = rootTsx.match(/videoSrc["'\s:]+["']([^"']+)["']/);
 const videoSrc = match ? match[1] : "output.mp4";
 
-// Salida: ../../output/<videoSrc>  (relativo a src/remotion/)
+// Output: ../../output/<videoSrc>  (relative  a src/remotion/)
 const outputPath = resolve(__dirname, "../../output", videoSrc);
 
 console.log(`🎬 Renderizando VideoEditor → ${outputPath}`);
