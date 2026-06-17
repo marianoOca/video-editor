@@ -1,57 +1,63 @@
 """
-Step 3: Detect silences (ffmpeg) + noise gaps (transcript) + repetitions (Claude).
-Outputs data/edit_plan.json with the list of segments to KEEP.
+Step 3: Build the edit plan (keep-driven).
 
-Cut boundaries use the word-level timestamps from data/transcript.json, which
-WhisperX produces via forced alignment (~20-50ms precision). That precision is
-what lets the script-driven first half of the pipeline cut without trimming
-syllables or leaving noise pegged to a cut.
+Keep = where speech is, from transcript word coverage. Each word covers
+[start, end] — START is whisper.cpp's DTW onset (accurate across pauses), END
+is capped upstream at MAX_WORD_DUR. Consecutive words within MAX_KEEP_GAP join
+a block; everything outside blocks — silence, background noise, leading/
+trailing junk, AND noise sitting in a pause between two words — is cut by
+construction (no word covers it). Each block gets KEEP_PAD of headroom.
 
-Usage: python3 3_analyze.py
+Before building blocks, words whose whole [start, end] sits inside a detected
+silence are dropped: whisper.cpp DTW sometimes displaces a word's timestamp into
+a pause (a 'hallucination island'), and that mislabel would otherwise seed a
+dead-air keep block. The word's real audio, if any, is preserved by its
+neighbours + edge snapping.
+
+After blocks are built, real silence that a word bridged INTO a block (a pause
+shorter than MAX_WORD_DUR start-to-start, hidden from the word-gap splitter
+because whisper.cpp gives no reliable word end) is cut straight from
+silencedetect: any silence longer than MAX_KEEP_GAP + 2*KEEP_PAD is removed,
+leaving KEEP_PAD of breathing room on each side. Mirrors editor-pro-max's
+pad-then-merge cut list.
+
+Whisper-labeled non-speech (bracketed tokens like '[Toc, toc, toc]', recorded
+as transcript['nonspeech']) is subtracted too — it catches loud noise fused
+into a word's coverage that the gap rule alone would keep.
+
+Optionally (--repetitions), Claude detects retakes/restarted sentences and
+those intervals are subtracted from the keep blocks.
+
+Usage:
+  python3 3_analyze.py                 # gap-based cuts only
+  python3 3_analyze.py --repetitions   # also remove retakes via Claude CLI
 """
 
-import subprocess
 import json
 import re
+import subprocess
+import argparse
 import sys
 from pathlib import Path
 from config import OUT_DIR, get_duration, call_claude
 
-SILENCE_THRESHOLD_DB = -25   # dB — aggressive: catches room tone and low background noise
-SILENCE_MIN_DURATION = 0.25  # seconds — catch short silences too
+MAX_KEEP_GAP = 0.4    # seconds — no-talk spans longer than this are cut, consider final removed gaps will be > MAX_KEEP_GAP + 2 * KEEP_PAD
+KEEP_PAD = 0.15       # seconds — headroom when no silence boundary to snap to
+MIN_SEGMENT = 0.2     # seconds — keep fragments shorter than this are dropped
+NONSPEECH_PAD = 0.05  # seconds — outward pad on whisper-labeled non-speech cuts
 
-NOISE_MIN_GAP = 0.40         # seconds — gap must exceed 2*NOISE_MARGIN so trimmed interval is non-empty
-NOISE_MARGIN = 0.15          # seconds — inward padding for noise gaps (snap to word edges adds more safety)
+# Edge-snapping: word DTW starts can land late (clipping a word's onset) and
+# capped word ends overshoot into trailing noise. We snap each keep block's
+# edges to the real silence→speech / speech→silence boundaries instead.
+SILENCE_DB = -35      # dB — energy below this counts as silence
+SILENCE_MIN = 0.15    # seconds — min silence to register (fine, to sit between taps)
+SNAP_LEAD = 0.6       # seconds — how far before a word's start a silence edge may be
+                      # and still count as that word's onset (covers DTW lateness)
+SNAP_SLOP = 0.15      # seconds — silence edge may sit slightly past the word start too
+SNAP_MIN = 0.05       # seconds — a closing silence must begin at least this far in
 
-SILENCE_MARGIN = 0.15        # seconds — inward padding applied to silencedetect intervals
-WORD_SAFETY_MS = 0.08        # seconds — extra inward buffer after snapping a cut to the nearest word edge
-                             # (covers WhisperX alignment error + phonetic tail past word.end)
-
-REPETITION_CHUNK_SEC = 180   # seconds of speech per Claude request when transcript is long
+REPETITION_CHUNK_SEC = 180     # seconds of speech per Claude request when transcript is long
 REPETITION_CHUNK_OVERLAP = 10  # seconds of overlap between consecutive chunks
-
-
-def detect_silences(video: Path) -> list[dict]:
-    """Run ffmpeg silencedetect and return list of {start, end} silence intervals."""
-    print("  detecting silences...")
-    result = subprocess.run(
-        [
-            "ffmpeg", "-i", str(video),
-            "-af", f"silencedetect=noise={SILENCE_THRESHOLD_DB}dB:d={SILENCE_MIN_DURATION}",
-            "-f", "null", "-"
-        ],
-        capture_output=True, text=True
-    )
-    output = result.stderr
-
-    silences = []
-    starts = re.findall(r"silence_start: ([\d.]+)", output)
-    ends = re.findall(r"silence_end: ([\d.]+)", output)
-
-    for s, e in zip(starts, ends):
-        silences.append({"start": float(s), "end": float(e)})
-
-    return silences
 
 
 def flatten_words(transcript: dict) -> list[dict]:
@@ -65,25 +71,136 @@ def flatten_words(transcript: dict) -> list[dict]:
     return words
 
 
-def detect_noise_gaps(transcript: dict, min_gap: float = NOISE_MIN_GAP) -> list[dict]:
+def detect_silences(video: Path) -> list[dict]:
+    """Run ffmpeg silencedetect; return silence intervals [{start, end}].
+    Used only to snap keep-block edges to real speech boundaries."""
+    result = subprocess.run(
+        ["ffmpeg", "-i", str(video),
+         "-af", f"silencedetect=noise={SILENCE_DB}dB:d={SILENCE_MIN}",
+         "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    out = result.stderr
+    starts = [float(m) for m in re.findall(r"silence_start: ([\d.]+)", out)]
+    ends = [float(m) for m in re.findall(r"silence_end: ([\d.]+)", out)]
+    return [{"start": s, "end": e} for s, e in zip(starts, ends)]
+
+
+def drop_silent_words(words: list[dict],
+                      silences: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Drop words whose entire [start, end] sits inside a silence interval.
+
+    silencedetect marks [a, b] as silence only when audio stays below SILENCE_DB,
+    and real speech has energy there — so a word fully inside a silence interval
+    has no speech at its timestamp. It is a whisper.cpp DTW mislabel (a word's
+    onset displaced off its real audio into a pause). Dropping it stops that
+    phantom from seeding a dead-air keep block; a real-onset word never lands
+    fully inside a silence, so this only removes mislabels, never spoken audio.
+
+    Returns (kept, dropped).
     """
-    Find inter-word gaps long enough to be non-speech audio.
-    silencedetect already catches true silence; remaining gaps with audio
-    are likely noises (coughs, breaths, lip smacks, throat clears) since
-    Whisper would have transcribed actual speech.
-    Returns list of {start, end} intervals.
+    if not silences:
+        return words, []
+    kept, dropped = [], []
+    for w in words:
+        in_silence = any(s["start"] <= w["start"] and w["end"] <= s["end"]
+                         for s in silences)
+        (dropped if in_silence else kept).append(w)
+    return kept, dropped
+
+
+def build_keep_blocks(words: list[dict], silences: list[dict],
+                      total_duration: float) -> list[dict]:
     """
-    print("  detecting noise gaps...")
-    words = flatten_words(transcript)
-    gaps = []
-    for prev, nxt in zip(words, words[1:]):
-        gap = nxt["start"] - prev["end"]
-        if gap >= min_gap:
-            gaps.append({
-                "start": prev["end"] + NOISE_MARGIN,
-                "end": nxt["start"] - NOISE_MARGIN,
-            })
-    return [g for g in gaps if g["end"] > g["start"]]
+    Keep = where speech is. Word coverage decides the keep regions and the split
+    points; silence boundaries fix each block's exact edges.
+
+    Word coverage: each word covers [start, capped-end]. Consecutive words within
+    MAX_KEEP_GAP join one block; a longer gap is cut. This removes noise that
+    sits in a PAUSE between two words (a knock has energy, so silence detection
+    keeps it, but no word covers it) and any leading/trailing audio with no words.
+
+    Edge snapping: whisper.cpp DTW starts can land late (clipping a word's onset)
+    and capped ends overshoot into trailing noise. So a block's START snaps back
+    to the end of the silence just before its first word (the true onset), and
+    its END snaps to the start of the silence just after its last word (the true
+    offset, which also drops trailing taps the cap would otherwise keep). When no
+    silence is in range, fall back to a plain KEEP_PAD.
+    """
+    if not words:
+        return []
+
+    # Word-coverage blocks; track first and last word starts for snapping.
+    raw = [{"first": words[0]["start"], "last": words[0]["start"], "end": words[0]["end"]}]
+    for w in words[1:]:
+        if w["start"] - raw[-1]["end"] <= MAX_KEEP_GAP:
+            raw[-1]["end"] = max(raw[-1]["end"], w["end"])
+            raw[-1]["last"] = w["start"]
+        else:
+            raw.append({"first": w["start"], "last": w["start"], "end": w["end"]})
+
+    blocks = []
+    for b in raw:
+        # START: latest silence whose end sits just before (or barely after) the
+        # first word — that silence end is the real speech onset.
+        lead = [s["end"] for s in silences
+                if b["first"] - SNAP_LEAD <= s["end"] <= b["first"] + SNAP_SLOP]
+        start = max(lead) if lead else b["first"] - KEEP_PAD
+
+        # END: earliest silence that begins after the last word's onset — its
+        # start is the real speech offset. Only trust it when it lands near the
+        # word's (capped) end; otherwise the word was too quiet for silencedetect
+        # to bound and the next silence is far away, so fall back to a plain pad.
+        trail = [s["start"] for s in silences if s["start"] >= b["last"] + SNAP_MIN]
+        fallback_end = b["end"] + KEEP_PAD
+        end = min(trail) if trail else fallback_end
+        if end > fallback_end + SNAP_LEAD:
+            end = fallback_end
+
+        start = max(0.0, start)
+        end = min(total_duration, end)
+        if end - start >= MIN_SEGMENT:
+            blocks.append({"start": start, "end": end})
+
+    # Merge any overlaps snapping created
+    if not blocks:
+        return []
+    merged = [blocks[0]]
+    for b in blocks[1:]:
+        if b["start"] <= merged[-1]["end"]:
+            merged[-1]["end"] = max(merged[-1]["end"], b["end"])
+        else:
+            merged.append(b)
+    return merged
+
+
+def cut_silence_gaps(keep: list[dict], silences: list[dict],
+                     min_gap: float, pad: float) -> tuple[list[dict], list[dict]]:
+    """Cut real silence that survives INSIDE a keep block.
+
+    build_keep_blocks splits on gaps in word *coverage*, but a word's end is
+    synthesised from the next word's start (whisper.cpp gives no reliable end —
+    its endMs tiles contiguously across pauses). So any pause shorter than
+    MAX_WORD_DUR of start-to-start spacing is bridged by the preceding word and
+    its silence lives inside a block, invisible to the word-gap splitter. This
+    reads the gaps straight from silencedetect and subtracts them.
+
+    A silence is cut only when its duration exceeds ``min_gap + 2*pad``, and
+    ``pad`` seconds are left on each side as breathing room — so a cut removes
+    (duration - 2*pad) and the join keeps 2*pad of natural pause. Shorter
+    silences are left untouched. This mirrors editor-pro-max's pad-then-merge
+    cut list (buildCutList + mergeSegments): a gap is removed iff
+    gap > mergeGap + 2*padding. Block-edge silences are already excluded by
+    build_keep_blocks' snapping, so in practice this only trims interior gaps.
+
+    Returns (new_keep, cuts_applied).
+    """
+    threshold = min_gap + 2 * pad
+    cuts = [{"start": s["start"] + pad, "end": s["end"] - pad}
+            for s in silences if (s["end"] - s["start"]) > threshold]
+    if not cuts:
+        return keep, []
+    return subtract_intervals(keep, cuts), cuts
 
 
 def _format_words_for_prompt(words: list[dict]) -> str:
@@ -102,7 +219,6 @@ def _format_words_for_prompt(words: list[dict]) -> str:
     if bucket:
         lines.append(f"[{bucket_start:.2f}s] {' '.join(x['word'].strip() for x in bucket)}")
     return "\n".join(lines)
-
 
 
 def _build_repetition_prompt(words_text: str) -> str:
@@ -129,14 +245,13 @@ def _build_repetition_prompt(words_text: str) -> str:
     )
 
 
-def find_repetitions(transcript: dict) -> list[dict]:
+def find_repetitions(words: list[dict]) -> list[dict]:
     """
     Use the claude CLI to identify retake/repetition segments.
     Feeds word-level data so cut boundaries align with word edges.
     For long transcripts, chunks the input with overlap and merges results.
     """
     print("  asking Claude to identify repetitions...")
-    words = flatten_words(transcript)
     if not words:
         return []
 
@@ -172,96 +287,38 @@ def find_repetitions(transcript: dict) -> list[dict]:
     return deduped
 
 
-def snap_cut_to_words(
-    cut: dict,
-    words: list[dict],
-    safety: float = WORD_SAFETY_MS,
-) -> "dict | None":
-    """
-    Shrink a cut interval inward so it never crosses a word from the transcript.
-
-    For the cut [a, b], find the latest word ending at or before `a` and the
-    earliest word starting at or after `b`. The cut is pushed inward to leave
-    `safety` seconds of headroom past those word edges — covering WhisperX
-    alignment error and the phonetic tail that extends past `word.end`.
-
-    Returns None if the snap collapses the cut (less than 50ms remaining).
-    """
-    a, b = cut["start"], cut["end"]
-
-    prev_end = max((w["end"] for w in words if w["end"] <= a), default=None)
-    next_start = min((w["start"] for w in words if w["start"] >= b), default=None)
-
-    new_a = max(a, prev_end + safety) if prev_end is not None else a
-    new_b = min(b, next_start - safety) if next_start is not None else b
-
-    if new_b - new_a < 0.05:
-        return None
-    return {**cut, "start": new_a, "end": new_b}
+def subtract_intervals(keep: list[dict], cuts: list[dict]) -> list[dict]:
+    """Subtract cut intervals from keep blocks, dropping fragments shorter
+    than MIN_SEGMENT."""
+    result = []
+    for block in keep:
+        pieces = [dict(block)]
+        for cut in cuts:
+            next_pieces = []
+            for p in pieces:
+                if cut["end"] <= p["start"] or cut["start"] >= p["end"]:
+                    next_pieces.append(p)
+                    continue
+                if cut["start"] > p["start"]:
+                    next_pieces.append({"start": p["start"], "end": cut["start"]})
+                if cut["end"] < p["end"]:
+                    next_pieces.append({"start": cut["end"], "end": p["end"]})
+            pieces = next_pieces
+        result.extend(p for p in pieces if p["end"] - p["start"] >= MIN_SEGMENT)
+    return result
 
 
-def merge_cuts(
-    silences: list[dict],
-    repetitions: list[dict],
-    noises: list[dict],
-    words: list[dict],
-) -> list[dict]:
-    """Merge silence, noise, and repetition intervals into a single sorted list
-    of cuts, then snap each cut to the nearest word edges so no cut crosses a
-    spoken word."""
+def keep_to_cuts(keep: list[dict], total_duration: float) -> list[dict]:
+    """Complement of the keep blocks — for reporting and edit_plan.json."""
     cuts = []
-    for s in silences:
-        cuts.append({"start": s["start"] + SILENCE_MARGIN,
-                     "end": s["end"] - SILENCE_MARGIN, "type": "silence"})
-    for n in noises:
-        cuts.append({"start": n["start"], "end": n["end"], "type": "noise"})
-    for r in repetitions:
-        cuts.append({"start": r["start"], "end": r["end"], "type": "repetition",
-                     "reason": r.get("reason", "")})
-
-    cuts = [c for c in cuts if c["end"] > c["start"]]
-    cuts.sort(key=lambda x: x["start"])
-
-    merged = []
-    for cut in cuts:
-        if merged and cut["start"] <= merged[-1]["end"]:
-            merged[-1]["end"] = max(merged[-1]["end"], cut["end"])
-            merged[-1]["type"] = "merged"
-        else:
-            merged.append(cut)
-
-    snapped = []
-    dropped = 0
-    for cut in merged:
-        s = snap_cut_to_words(cut, words)
-        if s is not None:
-            snapped.append(s)
-        else:
-            dropped += 1
-    if dropped:
-        print(f"  dropped {dropped} cut(s) that collapsed after word-edge snap")
-    return snapped
-
-
-def cuts_to_keep(cuts: list[dict], total_duration: float, min_segment: float = 0.2) -> list[dict]:
-    """Invert cuts to get the segments to KEEP."""
-    keep = []
     cursor = 0.0
-    for cut in cuts:
-        seg_dur = cut["start"] - cursor
-        if seg_dur >= min_segment:
-            keep.append({"start": cursor, "end": cut["start"]})
-        elif seg_dur > 0:
-            print(f"  dropped segment {cursor:.3f}s–{cut['start']:.3f}s "
-                  f"({seg_dur * 1000:.0f}ms, below min_segment={min_segment*1000:.0f}ms)")
-        cursor = cut["end"]
-    tail_dur = total_duration - cursor
-    if tail_dur >= min_segment:
-        keep.append({"start": cursor, "end": total_duration})
-    elif tail_dur > 0:
-        print(f"  dropped tail {cursor:.3f}s–{total_duration:.3f}s "
-              f"({tail_dur * 1000:.0f}ms, below min_segment={min_segment*1000:.0f}ms)")
-    return keep
+    for block in keep:
+        if block["start"] - cursor > 0:
+            cuts.append({"start": cursor, "end": block["start"], "type": "no-speech"})
+        cursor = block["end"]
+    if total_duration - cursor > 0:
+        cuts.append({"start": cursor, "end": total_duration, "type": "no-speech"})
+    return cuts
 
 
 def _sum_duration(items: list[dict]) -> float:
@@ -269,6 +326,11 @@ def _sum_duration(items: list[dict]) -> float:
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repetitions", action="store_true",
+                        help="Also detect and cut retakes/restarted sentences (Claude CLI)")
+    args = parser.parse_args()
+
     combined = OUT_DIR / "combined.mp4"
     transcript_path = OUT_DIR / "transcript.json"
 
@@ -285,25 +347,60 @@ def main():
     total_duration = get_duration(combined)
     print(f"  Video duration: {total_duration:.1f}s")
 
-    silences = detect_silences(combined)
-    print(f"  Found {len(silences)} silence intervals ({_sum_duration(silences):.1f}s)")
-
-    noises = detect_noise_gaps(transcript)
-    print(f"  Found {len(noises)} noise gaps ({_sum_duration(noises):.1f}s)")
-
-    repetitions = find_repetitions(transcript)
-    print(f"  Found {len(repetitions)} repetition intervals ({_sum_duration(repetitions):.1f}s)")
-
     words = flatten_words(transcript)
-    cuts = merge_cuts(silences, repetitions, noises, words)
-    keep = cuts_to_keep(cuts, total_duration)
+    print(f"  Transcript words: {len(words)}")
 
-    cut_time = _sum_duration(cuts)
-    saved = total_duration - cut_time
+    silences = detect_silences(combined)
+
+    words, dropped_silent = drop_silent_words(words, silences)
+    if dropped_silent:
+        detail = ", ".join(f"{w['word'].strip()!r}@{w['start']:.2f}s"
+                           for w in dropped_silent)
+        print(f"  dropped {len(dropped_silent)} word(s) stranded in silence "
+              f"(whisper hallucination): {detail}")
+
+    keep = build_keep_blocks(words, silences, total_duration)
+    print(f"  Keep blocks (word coverage, edges snapped to silence): "
+          f"{len(keep)} ({_sum_duration(keep):.1f}s)")
+
+    # Cut real silence that words bridged into a block. whisper.cpp has no
+    # reliable word end, so a pause shorter than MAX_WORD_DUR of start-to-start
+    # spacing is hidden from the word-gap splitter and survives as in-block dead
+    # air. Read gaps straight from silencedetect: cut any silence longer than
+    # MAX_KEEP_GAP + 2*KEEP_PAD, leaving KEEP_PAD of breathing room each side.
+    keep, gap_cuts = cut_silence_gaps(keep, silences, MAX_KEEP_GAP, KEEP_PAD)
+    if gap_cuts:
+        print(f"  cut {len(gap_cuts)} in-block silence gap(s) "
+              f"> {MAX_KEEP_GAP + 2 * KEEP_PAD:.2f}s → {len(keep)} blocks "
+              f"({_sum_duration(keep):.1f}s)")
+
+    # Cut whisper-labeled non-speech regions ([Toc...], [música]). These catch
+    # loud noise fused into a word's coverage that the gap rule alone keeps.
+    # Pad outward so the whole burst goes.
+    nonspeech = transcript.get("nonspeech", [])
+    if nonspeech:
+        padded = [{"start": max(0.0, n["start"] - NONSPEECH_PAD),
+                   "end": n["end"] + NONSPEECH_PAD} for n in nonspeech]
+        keep = subtract_intervals(keep, padded)
+        print(f"  Cut {len(nonspeech)} non-speech region(s) "
+              f"({_sum_duration(nonspeech):.1f}s) → {len(keep)} blocks "
+              f"({_sum_duration(keep):.1f}s)")
+
+    repetitions = []
+    if args.repetitions:
+        repetitions = find_repetitions(words)
+        print(f"  Found {len(repetitions)} repetition intervals "
+              f"({_sum_duration(repetitions):.1f}s)")
+        keep = subtract_intervals(keep, repetitions)
+
+    cuts = keep_to_cuts(keep, total_duration)
+
+    kept_time = _sum_duration(keep)
+    cut_time = total_duration - kept_time
 
     edit_plan = {
         "total_duration": total_duration,
-        "final_duration": saved,
+        "final_duration": kept_time,
         "cut_time": cut_time,
         "cuts": cuts,
         "keep": keep,
@@ -317,12 +414,9 @@ def main():
     print(f"\n✅ Done.")
     print(f"   edit_plan.json → {out_path}")
     print(f"   Original:  {total_duration:.1f}s")
-    print(f"   Cutting:   {cut_time:.1f}s "
-          f"(silences {_sum_duration(silences):.1f}s, "
-          f"noises {_sum_duration(noises):.1f}s, "
-          f"repetitions {_sum_duration(repetitions):.1f}s, "
-          f"{cut_time/total_duration*100:.0f}% total)")
-    print(f"   Final:     {saved:.1f}s ({saved/60:.1f} min)")
+    print(f"   Cutting:   {cut_time:.1f}s ({cut_time/total_duration*100:.0f}%)"
+          + (f" (incl. {_sum_duration(repetitions):.1f}s repetitions)" if repetitions else ""))
+    print(f"   Final:     {kept_time:.1f}s ({kept_time/60:.1f} min)")
     print(f"   Segments to keep: {len(keep)}")
 
 

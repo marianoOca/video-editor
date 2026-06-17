@@ -122,9 +122,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["reel", "youtube"], default=None,
                         help="Force mode (default: auto-detect from first video)")
+    parser.add_argument("--input", default=None,
+                        help="Process only this file (path relative to cwd or absolute)")
     args = parser.parse_args()
 
-    videos = sorted(INPUT_DIR.glob("*.mp4"))
+    if args.input:
+        p = Path(args.input)
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        if not p.exists():
+            print(f"ERROR: --input file not found: {p}")
+            sys.exit(1)
+        videos = [p]
+    else:
+        videos = sorted([v for ext in ("*.mp4", "*.mov") for v in INPUT_DIR.glob(ext)])
     if not videos:
         print("ERROR: no videos found in input/")
         sys.exit(1)

@@ -33,6 +33,7 @@ from config import (
     OUT_DIR,
     OUTPUT_DIR,
     get_duration,
+    get_mode,
     IMAGES_DIR,
     VIDEO_W_PX,
     VIDEO_H_PX,
@@ -303,17 +304,26 @@ def main():
 
     print("\nStep 5 — motion graphics")
 
-    # Load inputs
-    image_plan_path = OUT_DIR / "image_plan.json"
-    edit_plan_path = OUT_DIR / "edit_plan.json"
+    # Motion graphics (Ken Burns images + lower-thirds) are reel-only. For
+    # youtube, the final is just the cut video — copy it and skip Hyperframes.
     edited_mp4 = OUT_DIR / "edited.mp4"
     final_mp4 = OUTPUT_DIR / "final.mp4"
-    overlay_webm = OUT_DIR / "graphics_overlay.webm"
-    comp_html = OUT_DIR / "composition.html"
-
     if not edited_mp4.exists():
         print("ERROR: data/edited.mp4 not found. Run 4_render.py first.")
         sys.exit(1)
+
+    if get_mode()["mode"] == "youtube":
+        print("  youtube mode — skipping motion graphics (reel-only).")
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        shutil.copy2(edited_mp4, final_mp4)
+        print(f"  copied edited video → {final_mp4}")
+        return
+
+    # Load inputs
+    image_plan_path = OUT_DIR / "image_plan.json"
+    edit_plan_path = OUT_DIR / "edit_plan.json"
+    overlay_webm = OUT_DIR / "graphics_overlay.webm"
+    comp_html = OUT_DIR / "composition.html"
 
     image_plan: list[dict] = []
     if image_plan_path.exists() and include_images:

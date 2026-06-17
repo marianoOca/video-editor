@@ -1,25 +1,28 @@
 {
   "name": "video-editor",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Automated video editor with subtitles",
   "scripts": {
     "dev": "npx remotion studio",
     "render": "node render.mjs",
-    "build": "node render.mjs"
+    "build": "node render.mjs",
+    "postinstall": "patch-package && rm -rf node_modules/.cache/webpack"
   },
   "dependencies": {
-    "@remotion/captions": "^4.0.460",
-    "@remotion/cli": "^4.0.460",
-    "@remotion/google-fonts": "^4.0.460",
-    "@remotion/media": "^4.0.460",
-    "@remotion/player": "^4.0.460",
-    "@remotion/studio": "^4.0.460",
-    "remotion": "^4.0.460",
-    "zod": "^4.3.6"
+    "@remotion/captions": "4.0.478",
+    "@remotion/cli": "4.0.478",
+    "@remotion/google-fonts": "4.0.478",
+    "@remotion/install-whisper-cpp": "4.0.478",
+    "@remotion/media": "4.0.478",
+    "@remotion/player": "4.0.478",
+    "@remotion/studio": "4.0.478",
+    "remotion": "4.0.478",
+    "zod": "4.3.6"
   },
   "devDependencies": {
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
+    "patch-package": "^8.0.1",
     "typescript": "^5.4.5"
   }
 }

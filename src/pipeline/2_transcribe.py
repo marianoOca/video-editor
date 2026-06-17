@@ -1,25 +1,64 @@
 """
-Step 2: Transcribe combined.mp4 with WhisperX.
+Step 2: Transcribe combined.mp4 with Whisper.cpp (token-level timestamps).
 
-WhisperX runs faster-whisper for transcription and then performs forced
-alignment with wav2vec2 to produce accurate word-level timestamps
-(~20-50ms precision). Everything runs locally — no audio leaves the machine.
+Uses @remotion/install-whisper-cpp (via src/remotion/scripts/transcribe.mjs)
+to run Whisper.cpp locally with DTW token-level timestamps — no audio leaves
+the machine. Word timestamps come from the model's own attention path, which
+avoids the forced-alignment failure mode where a word's end gets stretched
+across trailing silence.
+
+Long audio is transcribed in chunks. Whisper's long-form sequential decode
+carries previous-text context across its native 30s windows; on long audio that
+context loop self-reinforces into repeated phrases AND collapses DTW token
+timestamps onto a single instant (hundreds of zero-width words at one time).
+We split long audio at pauses into ~1-min chunks and transcribe each with a
+FRESH whisper call — no context carries across a boundary, so the loop can't
+form — then offset each chunk's timestamps back onto the full timeline. Short
+audio (<= CHUNK_TRIGGER_SEC) stays single-pass.
 
 Outputs word-level timestamps in data/transcript.json.
 
-Usage: python3 2_transcribe.py [--model small] [--lang es]
+Usage: python3 2_transcribe.py [--model medium] [--lang es]
 """
 
 import subprocess
 import json
-import os
+import re
 import sys
 import argparse
 from pathlib import Path
-from config import OUT_DIR
+from config import OUT_DIR, REMOTION_DIR, SRC_DIR, get_duration
+
+WHISPER_DIR = SRC_DIR.parent / "whisper.cpp"
+TRANSCRIBE_SCRIPT = REMOTION_DIR / "scripts" / "transcribe.mjs"
+
+# Gap between words that forces a new segment even without sentence punctuation
+SEGMENT_GAP_SEC = 1.0
+
+# Max word duration (seconds). Whisper.cpp gives accurate word STARTS (DTW) but
+# no reliable word ends, so each end is derived from the next word's start and
+# capped here — otherwise a word before a pause stretches across the whole gap.
+MAX_WORD_DUR = 0.7
+
+SENTENCE_END_RE = re.compile(r"[.!?…]+$")
+
+# --- Chunked transcription (long-audio hallucination guard) -----------------
+# Long files trip whisper's long-form context loop (repeated phrases + DTW
+# timestamp collapse). We split at pauses into ~1-min chunks, each a fresh
+# whisper call, so no previous-text context carries across a boundary.
+CHUNK_TRIGGER_SEC = 90.0    # only chunk when audio is longer than this
+CHUNK_TARGET_SEC = 60.0     # aim for ~1-min chunks
+CHUNK_SEARCH_SEC = 20.0     # search this far around the target for a pause to split on
+CHUNK_MIN_SEC = 20.0        # never emit a chunk shorter than this (absorb the tail)
+CHUNK_EDGE_PAD = 0.25       # seconds — keep this much silence around each chunk's
+                            # speech; a longer trailing silence crashes whisper.cpp's
+                            # DTW pass (WHISPER_ASSERT filter_width < a->ne[2])
+CHUNK_SILENCE_DB = -35      # dB — split only in confident pauses (quieter than this)
+CHUNK_SILENCE_MIN = 0.5     # seconds — min pause length to be a split candidate
 
 
 def extract_audio(video: Path, audio: Path):
+    """Whisper.cpp requires 16kHz mono WAV."""
     print("  extracting audio...")
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(video), "-ar", "16000", "-ac", "1", "-f", "wav", str(audio)],
@@ -27,61 +66,280 @@ def extract_audio(video: Path, audio: Path):
     )
 
 
-def run_whisperx(audio: Path, model: str, lang: str) -> dict:
-    """Run the WhisperX CLI. Returns the parsed JSON output."""
-    print(f"  running whisperx (model={model}, lang={lang})...")
-    # torch >=2.6 defaults torch.load to weights_only=True, which rejects the
-    # omegaconf globals pickled in pyannote's VAD checkpoint. Force the legacy
-    # full-unpickle behavior — the model comes from a trusted source.
-    env = {**os.environ, "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD": "1"}
+def _run_whisper(audio: Path, captions_path: Path, model: str, lang: str) -> list[dict]:
+    """Run Whisper.cpp via the Node script on one audio file. Returns the caption
+    list [{text, startMs, endMs, timestampMs, confidence}, ...]."""
     result = subprocess.run(
         [
-            sys.executable, "-m", "whisperx", str(audio),
-            "--model", model,
-            "--language", lang,
-            "--output_format", "json",
-            "--output_dir", str(OUT_DIR),
-            "--compute_type", "int8",
+            "node", str(TRANSCRIBE_SCRIPT),
+            str(audio), str(captions_path), model, lang, str(WHISPER_DIR),
         ],
-        capture_output=True, text=True, env=env
+        cwd=REMOTION_DIR,
     )
     if result.returncode != 0:
-        print("WhisperX error:")
-        print(result.stderr)
+        print("ERROR: whisper.cpp transcription failed (see output above).")
         sys.exit(1)
-
-    json_path = OUT_DIR / (audio.stem + ".json")
-    with open(json_path) as f:
+    with open(captions_path, encoding="utf-8") as f:
         return json.load(f)
 
 
-def flatten_segments(raw: dict) -> list[dict]:
-    """Convert WhisperX output to a flat list of segments with start/end/text.
-    WhisperX words also carry a 'score' field that we drop here."""
+def _detect_pauses(audio: Path) -> list[tuple[float, float]]:
+    """ffmpeg silencedetect → [(start, end), ...] pauses used as chunk split points.
+    Stricter threshold than the cut step so we only split in clear pauses."""
+    result = subprocess.run(
+        ["ffmpeg", "-i", str(audio),
+         "-af", f"silencedetect=noise={CHUNK_SILENCE_DB}dB:d={CHUNK_SILENCE_MIN}",
+         "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    out = result.stderr
+    starts = [float(m) for m in re.findall(r"silence_start: ([\d.]+)", out)]
+    ends = [float(m) for m in re.findall(r"silence_end: ([\d.]+)", out)]
+    return list(zip(starts, ends))
+
+
+def plan_chunks(duration: float,
+                pauses: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Split [0, duration] into ~CHUNK_TARGET_SEC chunks bounded by SPEECH, not raw
+    clock time. Pick a pause near each target as the split, then make each chunk
+    span from the previous split pause's END (speech onset) to the next split
+    pause's START (speech offset), plus a small CHUNK_EDGE_PAD clamped to half the
+    pause (so adjacent chunks never overlap → no duplicated boundary words).
+
+    Dropping the split-pause silence keeps words intact AND, crucially, stops a
+    chunk from ending in a long trailing silence — a trailing near-empty window
+    crashes whisper.cpp's experimental DTW timestamp pass
+    (WHISPER_ASSERT filter_width < a->ne[2]). Leading/trailing global silence is
+    treated as virtual boundary pauses so the first/last chunk is speech-bounded
+    too (the last chunk's trailing silence is exactly what triggered the assert)."""
+    # Choose boundary pauses near each ~target mark.
+    boundaries: list[tuple[float, float]] = []
+    cursor = 0.0
+    while duration - cursor > CHUNK_TARGET_SEC + CHUNK_MIN_SEC:
+        ideal = cursor + CHUNK_TARGET_SEC
+        lo, hi = ideal - CHUNK_SEARCH_SEC, ideal + CHUNK_SEARCH_SEC
+        cands = [p for p in pauses
+                 if lo <= (p[0] + p[1]) / 2 <= hi
+                 and p[0] > cursor + CHUNK_MIN_SEC]
+        # Prefer the LONGEST pause in the window (most confident silence → cleaner
+        # chunk edges, less whisper edge-token mangling), tie-broken by closeness
+        # to the ideal target. Falls back to a hard split if no pause qualifies.
+        p = (max(cands, key=lambda p: (p[1] - p[0], -abs((p[0] + p[1]) / 2 - ideal)))
+             if cands else (ideal, ideal))  # degenerate pause = hard split
+        boundaries.append(p)
+        cursor = (p[0] + p[1]) / 2
+
+    lead = next((p for p in pauses if p[0] <= 0.05), (0.0, 0.0))
+    trail = next((p for p in reversed(pauses) if p[1] >= duration - 0.05),
+                 (duration, duration))
+    edges = [lead] + boundaries + [trail]
+
+    chunks = []
+    for a, b in zip(edges, edges[1:]):
+        pad_s = min(CHUNK_EDGE_PAD, (a[1] - a[0]) / 2)
+        pad_e = min(CHUNK_EDGE_PAD, (b[1] - b[0]) / 2)
+        start = max(0.0, a[1] - pad_s)        # speech onset (- pad)
+        end = min(duration, b[0] + pad_e)     # speech offset (+ pad)
+        if end - start > 1.0:
+            chunks.append((start, end))
+    return chunks
+
+
+def _offset_captions(captions: list[dict], offset_s: float) -> list[dict]:
+    """Shift a chunk's caption timestamps onto the full-audio timeline."""
+    off = offset_s * 1000.0
+    for c in captions:
+        for k in ("startMs", "endMs", "timestampMs"):
+            if c.get(k) is not None:
+                c[k] = c[k] + off
+    return captions
+
+
+def transcribe_audio(audio: Path, model: str, lang: str) -> list[dict]:
+    """Transcribe `audio`, chunking long files to dodge whisper's long-form
+    repetition/timestamp-collapse loop. Short audio goes single-pass. Long audio
+    is split at pauses into ~1-min chunks, each transcribed by a FRESH whisper
+    call (no previous-text context carries across a boundary → the loop can't
+    form), then chunk timestamps are offset back onto the full timeline."""
+    duration = get_duration(audio)
+    if duration <= CHUNK_TRIGGER_SEC:
+        print(f"  running whisper.cpp single-pass "
+              f"(model={model}, lang={lang}, {duration:.0f}s)...")
+        return _run_whisper(audio, OUT_DIR / "whisper_captions.json", model, lang)
+
+    pauses = _detect_pauses(audio)
+    chunks = plan_chunks(duration, pauses)
+    print(f"  long audio ({duration:.0f}s) → {len(chunks)} chunk(s) "
+          f"(~{CHUNK_TARGET_SEC:.0f}s, split at pauses; context reset each chunk)")
+
+    # Per-chunk cache → step 2 is resumable: if whisper aborts on a later chunk
+    # (e.g. the DTW assert), completed chunks are reloaded on re-run instead of
+    # re-transcribed. Cache is keyed by audio size + model + lang + chunk bounds,
+    # so it invalidates when the input, model, or chunk plan changes.
+    cache_dir = OUT_DIR / "_chunks"
+    cache_dir.mkdir(exist_ok=True)
+    audio_size = audio.stat().st_size
+    chunk_wav = OUT_DIR / "_chunk.wav"
+    chunk_json = OUT_DIR / "_chunk_captions.json"
+    all_captions: list[dict] = []
+    for i, (start, end) in enumerate(chunks):
+        cache = cache_dir / f"chunk_{i:03d}.json"
+        if cache.exists():
+            data = json.loads(cache.read_text(encoding="utf-8"))
+            if (data.get("audio_size") == audio_size and data.get("model") == model
+                    and data.get("lang") == lang
+                    and abs(data["start"] - start) < 0.01
+                    and abs(data["end"] - end) < 0.01):
+                print(f"  chunk {i + 1}/{len(chunks)}: {start:.1f}s–{end:.1f}s "
+                      f"(cached, {len(data['captions'])} tokens)")
+                all_captions.extend(data["captions"])
+                continue
+        print(f"  chunk {i + 1}/{len(chunks)}: {start:.1f}s–{end:.1f}s "
+              f"({end - start:.1f}s)")
+        subprocess.run(
+            ["ffmpeg", "-y", "-ss", f"{start:.3f}", "-t", f"{end - start:.3f}",
+             "-i", str(audio), "-ar", "16000", "-ac", "1", "-f", "wav",
+             str(chunk_wav)],
+            check=True, stderr=subprocess.DEVNULL,
+        )
+        captions = _offset_captions(_run_whisper(chunk_wav, chunk_json, model, lang),
+                                    start)
+        cache.write_text(json.dumps({"audio_size": audio_size, "model": model,
+                                     "lang": lang, "start": start, "end": end,
+                                     "captions": captions}, ensure_ascii=False),
+                         encoding="utf-8")
+        all_captions.extend(captions)
+
+    # Persist the merged token stream for debugging, mirroring single-pass output.
+    with open(OUT_DIR / "whisper_captions.json", "w", encoding="utf-8") as f:
+        json.dump(all_captions, f, indent=2, ensure_ascii=False)
+    return all_captions
+
+
+def merge_tokens_to_words(captions: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Whisper.cpp emits sub-word tokens ('mic', 'ró', 'f', 'ono') plus detached
+    punctuation. A token starting with a space begins a new word; anything else
+    (continuation or punctuation) appends to the current word.
+
+    Timestamps: each token carries two times — 'startMs'/'endMs' (whisper's
+    char offsets, which TILE so every end equals the next token's start and
+    therefore stretch across pauses) and 'timestampMs' (the token's DTW
+    alignment to the audio, accurate even across gaps). We take the word START
+    from the DTW timestamp of its first token, and derive the word END from the
+    next word's start, capped at MAX_WORD_DUR. Starts are forced monotonic so
+    captions never go backwards on a DTW jitter.
+
+    Bracketed runs ('[Toc, toc, toc]', '[música]', '(risas)') are whisper's
+    label for NON-SPEECH audio (knocks, music, applause). Depth tracking drops
+    the whole run from the words, and its offset time range is returned
+    separately as a non-speech interval — a strong cut signal for loud noise
+    that is acoustically fused with adjacent speech (energy can't split it).
+
+    Returns (words, nonspeech) where nonspeech is a list of {start, end}.
+    """
+    words = []
+    nonspeech = []
+    dropped = 0
+    depth = 0
+    run_start = None
+    run_end = None
+
+    def close_run():
+        nonlocal run_start, run_end
+        if run_start is not None and run_end is not None and run_end > run_start:
+            nonspeech.append({"start": run_start, "end": run_end})
+        run_start = run_end = None
+
+    for c in captions:
+        raw = c.get("text") or ""
+        opens = raw.count("[") + raw.count("(")
+        closes = raw.count("]") + raw.count(")")
+        if depth > 0 or opens > 0:
+            # Inside a bracketed non-speech run: accumulate its offset bounds
+            s, e = c.get("startMs"), c.get("endMs")
+            if s is not None and run_start is None:
+                run_start = s / 1000.0
+            if e is not None:
+                run_end = e / 1000.0
+            depth = max(0, depth + opens - closes)
+            if depth == 0:
+                close_run()
+            continue
+
+        start_ms = c.get("timestampMs")
+        if start_ms is None:
+            start_ms = c.get("startMs")  # fallback when DTW is unavailable
+        if not raw.strip() or start_ms is None or re.fullmatch(r'[.…]+', raw.strip()):
+            dropped += 1
+            continue
+
+        # A no-leading-space token normally continues the current word (sub-word
+        # split: 'mic'+'ró'+'f'+'ono', tokens milliseconds apart). But the FIRST
+        # token of a fresh chunk also has no leading space, so it would glue onto
+        # the previous chunk's last word — discarding its own DTW timestamp (this
+        # dropped "ciento veinte"→"120" by appending it to "Unos" as "Unos120").
+        # Guard: if a continuation token's DTW time is more than MAX_WORD_DUR past
+        # the current word's start, it belongs to a different utterance → new word.
+        ts = start_ms / 1000.0
+        far = bool(words) and ts - words[-1]["start"] > MAX_WORD_DUR
+        starts_word = raw.startswith(" ") or not words or far
+        if starts_word:
+            words.append({"word": raw.strip(), "start": ts})
+        else:
+            words[-1]["word"] += raw.strip()
+    close_run()  # in case a run never closed its bracket
+
+    if dropped:
+        print(f"  WARNING: dropped {dropped} caption token(s) without text/timestamps")
+    if nonspeech:
+        print(f"  marked {len(nonspeech)} non-speech region(s) from bracketed tokens")
+
+    # Force monotonic starts, then derive each end from the next start (capped)
+    for i in range(1, len(words)):
+        if words[i]["start"] < words[i - 1]["start"]:
+            words[i]["start"] = words[i - 1]["start"]
+    for i, w in enumerate(words):
+        next_start = words[i + 1]["start"] if i + 1 < len(words) else w["start"] + MAX_WORD_DUR
+        w["end"] = min(max(next_start, w["start"]), w["start"] + MAX_WORD_DUR)
+    return words, nonspeech
+
+
+def words_to_segments(words: list[dict]) -> list[dict]:
+    """
+    Group merged words into the transcript.json segment schema:
+    [{start, end, text, words: [{word, start, end}]}].
+
+    A segment closes on sentence-ending punctuation or a gap > SEGMENT_GAP_SEC
+    to the next word.
+    """
     segments = []
-    total_dropped = 0
-    for seg in raw.get("segments", []):
-        aligned = []
-        for w in seg.get("words", []) or []:
-            if "start" in w and "end" in w:
-                aligned.append({"word": w["word"].strip(), "start": w["start"], "end": w["end"]})
-            else:
-                total_dropped += 1
-        segments.append({
-            "start": seg["start"],
-            "end": seg["end"],
-            "text": seg["text"].strip(),
-            "words": aligned,
-        })
-    if total_dropped:
-        print(f"  WARNING: dropped {total_dropped} word(s) without alignment timestamps "
-              f"(WhisperX forced-alignment failure)")
+    current: list[dict] = []
+
+    def flush():
+        if current:
+            segments.append({
+                "start": current[0]["start"],
+                "end": current[-1]["end"],
+                "text": " ".join(w["word"] for w in current),
+                "words": list(current),
+            })
+
+    for i, w in enumerate(words):
+        current.append(w)
+        next_gap = words[i + 1]["start"] - w["end"] if i + 1 < len(words) else 0.0
+        if SENTENCE_END_RE.search(w["word"]) or next_gap > SEGMENT_GAP_SEC:
+            flush()
+            current = []
+    flush()
+
     return segments
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="large-v3", help="Whisper model: tiny/base/small/medium/large-v3")
+    parser.add_argument("--model", default="large-v3",
+                        help="Whisper model: tiny/base/small/medium/large-v2/large-v3")
     parser.add_argument("--lang", default="es", help="Language code (es, en, ...)")
     args = parser.parse_args()
 
@@ -93,13 +351,15 @@ def main():
     audio = OUT_DIR / "audio.wav"
     extract_audio(combined, audio)
 
-    raw = run_whisperx(audio, args.model, args.lang)
-    segments = flatten_segments(raw)
+    captions = transcribe_audio(audio, args.model, args.lang)
+    words, nonspeech = merge_tokens_to_words(captions)
+    segments = words_to_segments(words)
 
     transcript = {
         "model": args.model,
         "language": args.lang,
         "segments": segments,
+        "nonspeech": nonspeech,
         "full_text": " ".join(s["text"] for s in segments),
     }
 

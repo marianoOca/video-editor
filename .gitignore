@@ -5,53 +5,32 @@
 .env
 .env.*
 
-# Generated graph cache
-src/graphify-out/
-
-# input/output videos (large, user-specific)
+# input/output/resources videos (large, user-specific)
 input/*
 output/*
+resources/*
 
-# Pipeline intermediate files
-src/data/*.mp4
-src/data/*.wav
-src/data/audio.json
-src/data/clip_map.json
-src/data/transcript.json
-src/data/edit_plan.json
-src/data/subtitles_words.json
-src/data/concat_list.txt
-
-# Remotion generated files
+# Pipeline and Remotion generated files
+src/data/*
+src/remotion/public/projects/
+src/remotion/public/images/
+src/remotion/public/*.mp4
+src/remotion/src/projects/
+src/remotion/src/Root.tsx
+src/remotion/src/subtitles.json
+src/remotion/src/titleCards.json
 src/remotion/node_modules/
 src/remotion/out/
-src/remotion/public/edited.mp4
-src/remotion/public/aislop.mp4
 
-# Pipeline-generated image overlays
-src/remotion/public/images/
-
-# Agendia composition (standalone client project — source + media)
-src/remotion/src/agendia/
-src/remotion/public/agendia/
-
-# Caro composition (standalone birthday project — source + media)
-src/remotion/src/caro/
-src/remotion/public/caro/
-
-# Additional pipeline intermediate formats
-src/data/*.webm
-src/data/*.mov
-
-# Output — all video formats
-output/*.webm
-output/*.mov
+# Active-project state (machine-local)
+.ve_active_project
 
 # Claude Code worktrees (transient, not project content)
 .claude/worktrees/
+HANDOFF-*.md
 
-# Brand resources (client logos — not for public repo)
-resources/
+# Whisper.cpp install + models (downloaded by 2_transcribe.py)
+whisper.cpp/
 
 # Python
 __pycache__/

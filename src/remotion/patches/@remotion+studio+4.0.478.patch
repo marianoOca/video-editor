@@ -1,0 +1,43 @@
+diff --git a/node_modules/@remotion/studio/dist/components/OptionsPanel.js b/node_modules/@remotion/studio/dist/components/OptionsPanel.js
+index b04bbd1..4af40bf 100644
+--- a/node_modules/@remotion/studio/dist/components/OptionsPanel.js
++++ b/node_modules/@remotion/studio/dist/components/OptionsPanel.js
+@@ -19,6 +19,7 @@ const actions_1 = require("./RenderQueue/actions");
+ const RendersTab_1 = require("./RendersTab");
+ const Tabs_1 = require("./Tabs");
+ const VisualControlsContent_1 = require("./VisualControls/VisualControlsContent");
++const SubtitlesTab_1 = require("../../../../../src/studio/SubtitlesTab");
+ const localStorageKey = 'remotion.sidebarPanel';
+ const getSelectedPanel = (renderingAvailable) => {
+     if (!renderingAvailable) {
+@@ -31,7 +32,10 @@ const getSelectedPanel = (renderingAvailable) => {
+     if (panel === 'visual-controls') {
+         return 'visual-controls';
+     }
+-    return 'input-props';
++    if (panel === 'subtitles') {
++        return 'subtitles';
++    }
++    return 'subtitles';
+ };
+ const tabsContainer = {
+     backgroundColor: colors_1.BACKGROUND,
+@@ -67,6 +71,10 @@ const OptionsPanel = ({ readOnlyStudio }) => {
+         setPanel('visual-controls');
+         (0, exports.persistSelectedOptionsSidebarPanel)('visual-controls');
+     }, []);
++    const onSubtitlesSelected = (0, react_1.useCallback)(() => {
++        setPanel('subtitles');
++        (0, exports.persistSelectedOptionsSidebarPanel)('subtitles');
++    }, []);
+     (0, react_1.useImperativeHandle)(exports.optionsSidebarTabs, () => {
+         return {
+             selectRendersPanel: () => {
+@@ -186,6 +194,6 @@ const OptionsPanel = ({ readOnlyStudio }) => {
+         e.stopPropagation();
+     }, []);
+     return (jsx_runtime_1.jsxs("div", { style: container, className: "css-reset", onPointerDown: onPointerDown, children: [
+-            jsx_runtime_1.jsx("div", { style: tabsContainer, children: jsx_runtime_1.jsxs(Tabs_1.Tabs, { children: [visualControlsTabActivated ? (jsx_runtime_1.jsx(Tabs_1.Tab, { selected: panel === 'visual-controls', onClick: onVisualControlsSelected, children: "Controls" })) : null, jsx_runtime_1.jsxs(Tabs_1.Tab, { selected: panel === 'input-props', onClick: onPropsSelected, style: { justifyContent: 'space-between' }, children: ["Props", hasLocalModifications ? (jsx_runtime_1.jsx(SchemaResetButton_1.SchemaResetButton, { onClick: resetToOriginal })) : null] }), renderingAvailable ? (jsx_runtime_1.jsx(RendersTab_1.RendersTab, { onClick: onRendersSelected, selected: panel === 'renders' })) : null] }) }), panel === 'input-props' ? (composition ? (jsx_runtime_1.jsx(DefaultPropsEditor_1.DefaultPropsEditor, { unresolvedComposition: composition, defaultProps: currentDefaultProps, setDefaultProps: setDefaultProps, propsEditType: "default-props" }, composition.id)) : null) : panel === 'visual-controls' && visualControlsTabActivated ? (jsx_runtime_1.jsx(VisualControlsContent_1.VisualControlsContent, {})) : !renderingAvailable ? null : (jsx_runtime_1.jsx(RenderQueue_1.RenderQueue, {}))] }));
++            jsx_runtime_1.jsx("div", { style: tabsContainer, children: jsx_runtime_1.jsxs(Tabs_1.Tabs, { children: [jsx_runtime_1.jsx(Tabs_1.Tab, { selected: panel === 'subtitles', onClick: onSubtitlesSelected, children: "Subtitles" }), visualControlsTabActivated ? (jsx_runtime_1.jsx(Tabs_1.Tab, { selected: panel === 'visual-controls', onClick: onVisualControlsSelected, children: "Controls" })) : null, jsx_runtime_1.jsxs(Tabs_1.Tab, { selected: panel === 'input-props', onClick: onPropsSelected, style: { justifyContent: 'space-between' }, children: ["Props", hasLocalModifications ? (jsx_runtime_1.jsx(SchemaResetButton_1.SchemaResetButton, { onClick: resetToOriginal })) : null] }), renderingAvailable ? (jsx_runtime_1.jsx(RendersTab_1.RendersTab, { onClick: onRendersSelected, selected: panel === 'renders' })) : null] }) }), panel === 'input-props' ? (composition ? (jsx_runtime_1.jsx(DefaultPropsEditor_1.DefaultPropsEditor, { unresolvedComposition: composition, defaultProps: currentDefaultProps, setDefaultProps: setDefaultProps, propsEditType: "default-props" }, composition.id)) : null) : panel === 'visual-controls' && visualControlsTabActivated ? (jsx_runtime_1.jsx(VisualControlsContent_1.VisualControlsContent, {})) : panel === 'subtitles' ? (jsx_runtime_1.jsx(SubtitlesTab_1.SubtitlesTab, { defaultProps: currentDefaultProps, setDefaultProps: setDefaultProps })) :!renderingAvailable ? null : (jsx_runtime_1.jsx(RenderQueue_1.RenderQueue, {}))] }));
+ };
+ exports.OptionsPanel = OptionsPanel;

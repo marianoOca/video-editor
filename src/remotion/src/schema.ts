@@ -4,6 +4,11 @@ export const captionSchema = z.object({
   startMs: z.number().describe("Inicio (ms)"),
   endMs: z.number().describe("Fin (ms)"),
   text: z.string().describe("Texto del subtítulo"),
+  cutIndex: z
+    .number()
+    .int()
+    .optional()
+    .describe("Índice del corte (cut) al que pertenece"),
   words: z
     .array(z.object({ startMs: z.number(), endMs: z.number() }))
     .optional()
@@ -31,9 +36,12 @@ export const titleCardSchema = z.object({
 
 export const compositionSchema = z.object({
   videoSrc: z.string(),
+  project: z.string().optional().describe("Nombre del proyecto (para el sidecar de cortes)"),
+  videoVersion: z.number().optional().describe("Token cache-bust del video re-cortado"),
   imageOverlays: z.array(imageOverlaySchema).default([]),
   captions: z.array(captionSchema).default([]),
   titleCards: z.array(titleCardSchema).default([]),
+  captionsEnabled: z.boolean().default(false).describe("Mostrar subtítulos sobre el video"),
 });
 
 export type CaptionSegment = z.infer<typeof captionSchema>;
