@@ -19,7 +19,7 @@ SIDECAR_PORT = 9848  # local sidecar for Studio "Apply" (delete-cut → re-rende
 # A "project" is a named workspace under src/data/<name>/ holding all pipeline
 # intermediates for one edit. input/ and output/ stay shared at the repo root.
 # The active project is resolved at import time (path constants depend on it):
-#   VE_PROJECT env var  >  .ve_active_project state file  >  "default".
+#   VE_PROJECT env var  >  .ve_active_project state file  >  first input video.
 # run_all.py / project.py set VE_PROJECT before spawning steps; subprocess steps
 # inherit it. Direct step invocations fall back to the state file.
 STATE_FILE = REPO_ROOT / ".ve_active_project"
@@ -82,7 +82,7 @@ VIDEO_H_PX = REEL_H
 
 # --- ffmpeg encoding fragments ---
 FFMPEG_X264_FAST_ARGS = ["-c:v", "libx264", "-preset", "fast", "-crf", "18"]
-FFMPEG_AAC_STEREO_ARGS = ["-c:a", "aac", "-ar", "44100", "-ac", "2"]
+FFMPEG_AAC_STEREO_ARGS = ["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"]
 
 # --- Image overlays ---
 IMAGES_DIR = INPUT_DIR / "images"
@@ -134,8 +134,48 @@ def get_duration(path: Path) -> float:
     return float(json.loads(result.stdout)["format"]["duration"])
 
 
-def call_claude(prompt: str, extra_args: Optional[list] = None, timeout: int = 90) -> Optional[dict]:
-    """Run Claude CLI, strip markdown fences, parse JSON. Returns parsed dict or None on failure."""
+def run_ffmpeg(cmd: list, *, check: bool = True, **kwargs) -> subprocess.CompletedProcess:
+    """Run an ffmpeg (or other) command, surfacing stderr on failure.
+
+    Captures stderr (stdout discarded by default) so a failing command prints the
+    real ffmpeg error tail instead of dying with a bare CalledProcessError traceback.
+    Replaces scattered subprocess.run(..., stderr=subprocess.DEVNULL) calls that hid
+    diagnostics. Pass check=False to inspect the returncode without raising."""
+    kwargs.setdefault("stdout", subprocess.DEVNULL)
+    proc = subprocess.run(cmd, stderr=subprocess.PIPE, text=True, **kwargs)
+    if check and proc.returncode != 0:
+        tail = "\n".join((proc.stderr or "").strip().splitlines()[-15:])
+        print(f"  ERROR: {cmd[0]} failed (exit {proc.returncode}):\n{tail}")
+        raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=proc.stderr)
+    return proc
+
+
+def silencedetect(path: Path, noise_db: float, min_dur: float,
+                  total_duration: Optional[float] = None) -> list:
+    """Run ffmpeg silencedetect on `path`; return [(start, end), ...] pauses (seconds).
+
+    Shared by step 2 (chunk split points) and step 3 (keep-block edge snapping). If
+    the file ends mid-silence ffmpeg emits a trailing silence_start with no matching
+    silence_end; when total_duration is given that unpaired start is closed at
+    total_duration instead of being silently dropped by zip()."""
+    proc = run_ffmpeg(
+        ["ffmpeg", "-i", str(path),
+         "-af", f"silencedetect=noise={noise_db}dB:d={min_dur}",
+         "-f", "null", "-"]
+    )
+    out = proc.stderr or ""
+    starts = [float(m) for m in re.findall(r"silence_start: ([\d.]+)", out)]
+    ends = [float(m) for m in re.findall(r"silence_end: ([\d.]+)", out)]
+    pairs = list(zip(starts, ends))
+    if len(starts) > len(ends) and total_duration is not None:
+        pairs.append((starts[len(ends)], total_duration))
+    return pairs
+
+
+def call_claude(prompt: str, extra_args: Optional[list] = None, timeout: Optional[int] = None) -> Optional[dict]:
+    """Run Claude CLI, strip markdown fences, parse JSON. Returns parsed dict or None on failure.
+    timeout defaults to None (no limit): analysis scales with transcript length and a
+    half-hour video must not be killed mid-call. Pass an int only for a deliberate cap."""
     cmd = ["claude", "-p", prompt] + (extra_args or [])
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:

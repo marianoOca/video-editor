@@ -17,7 +17,6 @@ Usage:
 import argparse
 import json
 import os
-import shutil
 import sys
 
 # This CLI runs without an active project (list/switch/...); opt out of config's
@@ -85,18 +84,15 @@ def cmd_rebuild(args):
 
 def cmd_delete(args):
     name = sanitize_project_name(args.name)
-    d = DATA_ROOT / name
-    existed = d.exists() or snapshot_path(name).exists()
-    if d.exists():
-        shutil.rmtree(d)
-    delete_project(name)  # removes snapshot + public assets, regenerates Root.tsx
-    if not existed:
+    # delete_project wipes data dir + snapshot + public assets, clears the
+    # active-project state if it pointed here, and regenerates Root.tsx.
+    removed = delete_project(name)
+    if not removed:
         print(f"project '{name}' not found (nothing to delete).")
         return
-    print(f"deleted project '{name}' (data + Remotion composition).")
-    if STATE_FILE.exists() and STATE_FILE.read_text(encoding="utf-8").strip() == name:
-        STATE_FILE.unlink()
-        print("  cleared active-project state (was the deleted project).")
+    print(f"deleted project '{name}':")
+    for path in removed:
+        print(f"  - {path}")
 
 
 def main():

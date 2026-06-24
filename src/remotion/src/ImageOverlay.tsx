@@ -16,73 +16,97 @@ const SingleImageOverlay: React.FC<{
   overlay: ImageOverlay;
   index: number;
   durationFrames: number;
-}> = ({ overlay, index, durationFrames }) => {
+  project?: string;
+}> = ({ overlay, index, durationFrames, project }) => {
   const frame = useCurrentFrame();
   const { width, height } = useVideoConfig();
   const { isStudio } = getRemotionEnvironment();
 
   const [dragging, setDragging] = useState(false);
+  // Live drag position (Studio only). null → use the persisted overlay.x/y.
+  // Lets the image follow the cursor via local re-renders WITHOUT writing to the
+  // Studio store on every mousemove — the durable write lands once on mouseup.
+  const [livePos, setLivePos] = useState<{ x: number; y: number } | null>(null);
   const dragStart = useRef<{ mouseX: number; mouseY: number; x: number; y: number } | null>(null);
 
+  const posX = livePos?.x ?? overlay.x;
+  const posY = livePos?.y ?? overlay.y;
   const imageWidth = Math.round(width * 0.35);
-  const left = Math.round(overlay.x * width);
-  const top = Math.round(overlay.y * height);
+  const left = Math.round(posX * width);
+  const top = Math.round(posY * height);
 
+  // Fade in/out. The interpolate input range must be strictly increasing, which
+  // breaks for very short overlays (fadeOutStart could reach/exceed durationFrames),
+  // so cap it below durationFrames and hold full opacity when there's no room to fade.
   const halfDur = Math.max(1, Math.floor(durationFrames / 2));
   const fadeDuration = Math.min(FADE_FRAMES, halfDur);
-  const fadeOutStart = Math.max(fadeDuration + 1, durationFrames - fadeDuration);
-  const opacity = interpolate(
-    frame,
-    [0, fadeDuration, fadeOutStart, durationFrames],
-    [0, 1, 1, 0],
-    { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
+  const fadeOutStart = Math.min(
+    durationFrames - 1,
+    Math.max(fadeDuration + 1, durationFrames - fadeDuration)
   );
+  const opacity =
+    durationFrames < 3
+      ? 1
+      : interpolate(
+          frame,
+          [0, fadeDuration, fadeOutStart, durationFrames],
+          [0, 1, 1, 0],
+          { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
+        );
 
   const onMouseDown = useCallback(
     (e: React.MouseEvent) => {
       if (!isStudio) return;
       e.stopPropagation();
       setDragging(true);
-      dragStart.current = {
-        mouseX: e.clientX,
-        mouseY: e.clientY,
-        x: overlay.x,
-        y: overlay.y,
+      const origin = { mouseX: e.clientX, mouseY: e.clientY, x: overlay.x, y: overlay.y };
+      dragStart.current = origin;
+      let latest = { x: overlay.x, y: overlay.y };
+
+      // Local-only live feedback — no store write per move (was hammering
+      // updateDefaultProps on every mousemove with an async handler).
+      const onMove = (ev: MouseEvent) => {
+        const dx = (ev.clientX - origin.mouseX) / width;
+        const dy = (ev.clientY - origin.mouseY) / height;
+        latest = {
+          x: Math.max(0, Math.min(0.65, origin.x + dx)),
+          y: Math.max(0, Math.min(0.60, origin.y + dy)),
+        };
+        setLivePos(latest);
       };
 
-      const onMove = async (ev: MouseEvent) => {
-        if (!dragStart.current) return;
-        const dx = (ev.clientX - dragStart.current.mouseX) / width;
-        const dy = (ev.clientY - dragStart.current.mouseY) / height;
-        const newX = Math.max(0, Math.min(0.65, dragStart.current.x + dx));
-        const newY = Math.max(0, Math.min(0.60, dragStart.current.y + dy));
-
+      const onUp = async () => {
+        setDragging(false);
+        dragStart.current = null;
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        if (!project) {
+          setLivePos(null);
+          return;
+        }
+        // Single durable write on release. compositionId is the project name —
+        // Root.tsx registers <Composition id={p.name}>; the old hardcoded
+        // "VideoEditor" id matched no composition, so every write silently no-op'd.
         const { updateDefaultProps } = await import("@remotion/studio");
         await updateDefaultProps({
-          compositionId: "VideoEditor",
+          compositionId: project,
           defaultProps: ({ savedDefaultProps }: { savedDefaultProps: Record<string, unknown> }) => {
             const overlays = (savedDefaultProps.imageOverlays as ImageOverlay[]) ?? [];
             return {
               ...savedDefaultProps,
               imageOverlays: overlays.map((o, i) =>
-                i === index ? { ...o, x: newX, y: newY } : o
+                i === index ? { ...o, x: latest.x, y: latest.y } : o
               ),
             };
           },
         });
-      };
-
-      const onUp = () => {
-        setDragging(false);
-        dragStart.current = null;
-        window.removeEventListener("mousemove", onMove);
-        window.removeEventListener("mouseup", onUp);
+        setLivePos(null); // store now holds latest → drop the local override
       };
 
       window.addEventListener("mousemove", onMove);
       window.addEventListener("mouseup", onUp);
     },
-    [isStudio, overlay.x, overlay.y, width, height, index]
+    [isStudio, overlay.x, overlay.y, width, height, index, project]
   );
 
   return (
@@ -117,8 +141,9 @@ const SingleImageOverlay: React.FC<{
   );
 };
 
-export const ImageOverlayLayer: React.FC<{ overlays: ImageOverlay[] }> = ({
+export const ImageOverlayLayer: React.FC<{ overlays: ImageOverlay[]; project?: string }> = ({
   overlays,
+  project,
 }) => {
   const { fps } = useVideoConfig();
 
@@ -140,6 +165,7 @@ export const ImageOverlayLayer: React.FC<{ overlays: ImageOverlay[] }> = ({
               overlay={overlay}
               index={index}
               durationFrames={durationFrames}
+              project={project}
             />
           </Sequence>
         );

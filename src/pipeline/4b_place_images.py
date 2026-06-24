@@ -13,7 +13,6 @@ Output: data/image_plan.json
 Usage: python3 4b_place_images.py
 """
 
-import re
 import subprocess
 import json
 import sys
@@ -94,24 +93,18 @@ def ask_claude_placement(frame_png: Path, image_name: str) -> tuple[float, float
         f"@{frame_png}"
     )
 
-    result = subprocess.run(
-        ["claude", "-p", prompt, "--output-format", "text"],
-        capture_output=True, text=True, timeout=60
-    )
-    if result.returncode != 0:
-        print(f"  WARNING: claude CLI error: {result.stderr[:200]}")
+    # call_claude handles the subprocess + fence-strip + JSON parse (the @filepath
+    # for Vision lives inside the prompt). Default placement on any failure.
+    data = call_claude(prompt, extra_args=["--output-format", "text"])
+    if not data:
         return 0.6, 0.05
-
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", result.stdout.strip())
     try:
-        data = json.loads(raw)
         x = max(0.0, min(0.65, float(data["x"])))
         y = max(0.0, min(0.60, float(data["y"])))
         print(f"    → x={x:.2f}, y={y:.2f} ({data.get('reasoning', '')})")
         return x, y
-    except (json.JSONDecodeError, KeyError, ValueError) as e:
+    except (KeyError, ValueError, TypeError) as e:
         print(f"  WARNING: could not parse placement response: {e}")
-        print(f"  Raw: {raw[:300]}")
         return 0.6, 0.05
 
 
@@ -154,7 +147,6 @@ def main():
     timing_entries = ask_claude_timing(images, subtitles, video_duration_ms)
     if not timing_entries:
         print("  No timing decisions returned. Skipping.")
-        out_path = OUT_DIR / "image_plan.json"
         with open(out_path, "w") as f:
             json.dump([], f)
         # Clear any stale overlays from a previous run of this project.
@@ -196,7 +188,6 @@ def main():
             "y": y,
         })
 
-    out_path = OUT_DIR / "image_plan.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(plan, f, indent=2)
 

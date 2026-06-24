@@ -29,7 +29,7 @@ import sys
 import argparse
 from pathlib import Path
 from config import (
-    INPUT_DIR, OUT_DIR, MODE_PATH, probe,
+    INPUT_DIR, OUT_DIR, MODE_PATH, probe, run_ffmpeg,
     REEL_W, REEL_H, YT_W, YT_H, VIDEO_FPS,
     FFMPEG_X264_FAST_ARGS, FFMPEG_AAC_STEREO_ARGS,
 )
@@ -42,9 +42,8 @@ def get_rotation(stream: dict) -> int:
     return 0
 
 
-def effective_dims(video: Path) -> tuple[int, int]:
-    """Return (width, height) accounting for rotation metadata."""
-    data = probe(video)
+def effective_dims(data: dict) -> tuple[int, int]:
+    """Return (width, height) accounting for rotation metadata, from probe() output."""
     vs = next(s for s in data["streams"] if s["codec_type"] == "video")
     w, h = int(vs["width"]), int(vs["height"])
     if abs(get_rotation(vs)) % 180 == 90:
@@ -52,8 +51,8 @@ def effective_dims(video: Path) -> tuple[int, int]:
     return w, h
 
 
-def detect_mode_from_video(video: Path) -> str:
-    w, h = effective_dims(video)
+def detect_mode(data: dict) -> str:
+    w, h = effective_dims(data)
     if w == h:
         raise SystemExit(
             "ERROR: square video not supported. Use --mode reel|youtube to force a mode."
@@ -71,11 +70,11 @@ def mode_config(mode: str) -> dict:
     raise SystemExit(f"ERROR: unknown mode '{mode}'. Use 'reel' or 'youtube'.")
 
 
-def normalize(video: Path, out: Path, target_w: int, target_h: int) -> float:
+def normalize(video: Path, out: Path, target_w: int, target_h: int, data: dict) -> float:
     """Normalize a single video to target_w x target_h. Letterboxes if aspect
     differs (so vertical clips in a youtube job, or vice versa, don't stretch).
+    `data` is the precomputed probe() output (probed once per video in main).
     Returns duration in seconds."""
-    data = probe(video)
     vs = next(s for s in data["streams"] if s["codec_type"] == "video")
     rotation = get_rotation(vs)
     duration = float(data["format"]["duration"])
@@ -115,7 +114,7 @@ def concatenate(norm_files: list[Path], out: Path):
         str(out)
     ]
     print("  concatenating clips...")
-    subprocess.run(cmd, check=True, stderr=subprocess.DEVNULL)
+    run_ffmpeg(cmd)
 
 
 def main():
@@ -123,13 +122,17 @@ def main():
     parser.add_argument("--mode", choices=["reel", "youtube"], default=None,
                         help="Force mode (default: auto-detect from first video)")
     parser.add_argument("--input", default=None,
-                        help="Process only this file (path relative to cwd or absolute)")
+                        help="Process only this file (absolute, relative to cwd, or bare name resolved in input/)")
     args = parser.parse_args()
 
     if args.input:
         p = Path(args.input)
         if not p.is_absolute():
-            p = Path.cwd() / p
+            # Try relative to cwd first, then fall back to input/ so a bare
+            # filename (e.g. --input prueba1.mp4) resolves to input/prueba1.mp4.
+            cwd_p = Path.cwd() / p
+            input_p = INPUT_DIR / p
+            p = cwd_p if cwd_p.exists() else input_p
         if not p.exists():
             print(f"ERROR: --input file not found: {p}")
             sys.exit(1)
@@ -142,11 +145,15 @@ def main():
 
     print(f"Found {len(videos)} videos: {[v.name for v in videos]}")
 
+    # Probe each video once; reuse for mode detection, mismatch warnings, and
+    # normalize (avoids 2x ffprobe per clip).
+    probes = {v: probe(v) for v in videos}
+
     if args.mode:
         mode = args.mode
         print(f"  mode forced via flag: {mode}")
     else:
-        mode = detect_mode_from_video(videos[0])
+        mode = detect_mode(probes[videos[0]])
         print(f"  mode auto-detected from {videos[0].name}: {mode}")
 
     cfg = mode_config(mode)
@@ -157,7 +164,7 @@ def main():
     if len(videos) == 1:
         # Single video: normalize directly to combined.mp4 — no concat needed
         video = videos[0]
-        duration = normalize(video, combined, target_w, target_h)
+        duration = normalize(video, combined, target_w, target_h, probes[video])
         clip_map = [{
             "name": video.name,
             "norm_path": str(combined),
@@ -169,7 +176,7 @@ def main():
         # each clip (guarantees uniform codec params for clean A/V sync at seams)
         primary_landscape = target_w > target_h
         for v in videos[1:]:
-            w, h = effective_dims(v)
+            w, h = effective_dims(probes[v])
             if (w > h) != primary_landscape:
                 print(f"  ⚠️  {v.name} orientation differs from target — will be letterboxed")
 
@@ -179,7 +186,7 @@ def main():
 
         for video in videos:
             norm_path = OUT_DIR / f"norm_{video.name}"
-            duration = normalize(video, norm_path, target_w, target_h)
+            duration = normalize(video, norm_path, target_w, target_h, probes[video])
             clip_map.append({
                 "name": video.name,
                 "norm_path": str(norm_path),

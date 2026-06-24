@@ -21,9 +21,7 @@ Usage:
 import argparse
 import json
 import shutil
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import requests
@@ -32,14 +30,12 @@ from config import (
     HYPERFRAMES_PORT,
     OUT_DIR,
     OUTPUT_DIR,
-    get_duration,
     get_mode,
     IMAGES_DIR,
-    VIDEO_W_PX,
-    VIDEO_H_PX,
     VIDEO_FPS,
     IMAGE_WIDTH_FRAC,
     FFMPEG_X264_FAST_ARGS,
+    run_ffmpeg,
     call_claude,
     ms_to_s,
 )
@@ -109,11 +105,17 @@ def ask_claude_lower_thirds(edit_plan: list[dict]) -> list[dict]:
 def build_composition_html(
     image_plan: list[dict],
     lower_thirds: list[dict],
-    video_duration_s: float,
     include_images: bool,
     include_lower_thirds: bool,
+    width: int,
+    height: int,
 ) -> str:
-    """Generate a Hyperframes HTML composition with transparent background."""
+    """Generate a Hyperframes HTML composition with transparent background.
+    width/height are the target dims from get_mode() (reel-only step).
+
+    The composition's length is the last element's data-end (Hyperframes sizes the
+    webm to content), which is shorter than the video. composite() handles that with
+    overlay eof_action=pass — so the overlay doesn't need the video duration."""
 
     elements: list[str] = []
 
@@ -127,14 +129,14 @@ def build_composition_html(
             y_frac = entry.get("y", 0.05)
 
             # Convert 0-1 fractions to pixel positions
-            px_x = int(x_frac * VIDEO_W_PX)
-            px_y = int(y_frac * VIDEO_H_PX)
-            img_w = int(IMAGE_WIDTH_FRAC * VIDEO_W_PX)
+            px_x = int(x_frac * width)
+            px_y = int(y_frac * height)
+            img_w = int(IMAGE_WIDTH_FRAC * width)
 
             total_frames = int((end_s - start_s) * VIDEO_FPS)
             # Ken Burns: drift 3% right + 2% down, zoom 1.0 → 1.12
-            drift_x = int(0.03 * VIDEO_W_PX)
-            drift_y = int(0.02 * VIDEO_H_PX)
+            drift_x = int(0.03 * width)
+            drift_y = int(0.02 * height)
 
             keyframes = json.dumps([
                 {"frame": 0, "x": px_x, "y": px_y},
@@ -208,7 +210,7 @@ def build_composition_html(
     body {{ margin: 0; background: transparent; overflow: hidden; }}
   </style>
 </head>
-<body data-resolution="portrait" data-composition-width="{VIDEO_W_PX}" data-composition-height="{VIDEO_H_PX}">
+<body data-resolution="portrait" data-composition-width="{width}" data-composition-height="{height}">
 {elements_html}
 </body>
 </html>"""
@@ -218,14 +220,14 @@ def build_composition_html(
 # Render via Hyperframes HTTP API
 # ---------------------------------------------------------------------------
 
-def render_composition(html: str, out_webm: Path):
+def render_composition(html: str, out_webm: Path, width: int, height: int):
     print(f"  sending composition to Hyperframes ({len(html)} chars)...")
 
     payload = {
         "input": {"type": "html", "value": html},
         "output": {
-            "width": VIDEO_W_PX,
-            "height": VIDEO_H_PX,
+            "width": width,
+            "height": height,
             "fps": {"num": VIDEO_FPS, "den": 1},
             "format": "webm",
             "quality": "high",
@@ -233,7 +235,7 @@ def render_composition(html: str, out_webm: Path):
     }
 
     url = f"http://localhost:{HYPERFRAMES_PORT}/render/stream"
-    with requests.post(url, json=payload, stream=True, timeout=300) as resp:
+    with requests.post(url, json=payload, stream=True) as resp:
         resp.raise_for_status()
         output_path = None
         for line in resp.iter_lines():
@@ -271,18 +273,21 @@ def render_composition(html: str, out_webm: Path):
 def composite(edited_mp4: Path, overlay_webm: Path, final_mp4: Path):
     print(f"  compositing overlay onto video → {final_mp4}...")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
+    # eof_action=pass: the overlay webm is only as long as its last element (Hyperframes
+    # sizes to content), so once it ends pass the main video through UNCHANGED. Without
+    # this, overlay's default eof_action=repeat freezes the webm's last frame (e.g. a
+    # logo at full opacity) over the rest of the video.
+    run_ffmpeg(
         [
             "ffmpeg", "-y",
             "-i", str(edited_mp4),
             "-i", str(overlay_webm),
-            "-filter_complex", "[0:v][1:v]overlay=0:0[v]",
+            "-filter_complex", "[0:v][1:v]overlay=0:0:eof_action=pass[v]",
             "-map", "[v]", "-map", "0:a",
             *FFMPEG_X264_FAST_ARGS,
             "-c:a", "copy",
             str(final_mp4),
-        ],
-        check=True,
+        ]
     )
     print(f"  done.")
 
@@ -312,7 +317,8 @@ def main():
         print("ERROR: data/edited.mp4 not found. Run 4_render.py first.")
         sys.exit(1)
 
-    if get_mode()["mode"] == "youtube":
+    mode = get_mode()
+    if mode["mode"] == "youtube":
         print("  youtube mode — skipping motion graphics (reel-only).")
         OUTPUT_DIR.mkdir(exist_ok=True)
         shutil.copy2(edited_mp4, final_mp4)
@@ -363,22 +369,21 @@ def main():
         print(f"  {final_mp4}")
         return
 
-    video_duration_s = get_duration(edited_mp4)
-
     # Build and save HTML composition
     html = build_composition_html(
         image_plan=image_plan,
         lower_thirds=lower_thirds,
-        video_duration_s=video_duration_s,
         include_images=include_images,
         include_lower_thirds=include_lower_thirds,
+        width=mode["width"],
+        height=mode["height"],
     )
     with open(comp_html, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"  composition.html written ({len(html)} chars)")
 
     # Render overlay
-    render_composition(html, overlay_webm)
+    render_composition(html, overlay_webm, mode["width"], mode["height"])
 
     # Composite
     composite(edited_mp4, overlay_webm, final_mp4)

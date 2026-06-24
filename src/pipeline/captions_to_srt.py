@@ -9,8 +9,8 @@ import json
 from pathlib import Path
 from srt_utils import ms_to_srt
 
-CAPTIONS_JSON = Path(__file__).parent.parent / "src/remotion/public/captions.json"
-CAPTIONS_SRT  = Path(__file__).parent.parent / "src/remotion/public/captions.srt"
+CAPTIONS_JSON = Path(__file__).parent.parent / "remotion/public/captions.json"
+CAPTIONS_SRT  = Path(__file__).parent.parent / "remotion/public/captions.srt"
 WORDS_PER_LINE = 5
 
 

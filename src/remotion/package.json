@@ -1,9 +1,10 @@
 {
   "name": "video-editor",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Automated video editor with subtitles",
   "scripts": {
-    "dev": "npx remotion studio",
+    "dev": "concurrently --kill-others -n studio,sidecar -c blue,green \"npx remotion studio\" \"python3 ../pipeline/sidecar.py\"",
+    "dev:studio": "npx remotion studio",
     "render": "node render.mjs",
     "build": "node render.mjs",
     "postinstall": "patch-package && rm -rf node_modules/.cache/webpack"
@@ -22,6 +23,7 @@
   "devDependencies": {
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
+    "concurrently": "^9.2.1",
     "patch-package": "^8.0.1",
     "typescript": "^5.4.5"
   }

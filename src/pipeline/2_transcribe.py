@@ -27,7 +27,7 @@ import re
 import sys
 import argparse
 from pathlib import Path
-from config import OUT_DIR, REMOTION_DIR, SRC_DIR, get_duration
+from config import OUT_DIR, REMOTION_DIR, SRC_DIR, get_duration, run_ffmpeg, silencedetect
 
 WHISPER_DIR = SRC_DIR.parent / "whisper.cpp"
 TRANSCRIBE_SCRIPT = REMOTION_DIR / "scripts" / "transcribe.mjs"
@@ -39,6 +39,13 @@ SEGMENT_GAP_SEC = 1.0
 # no reliable word ends, so each end is derived from the next word's start and
 # capped here — otherwise a word before a pause stretches across the whole gap.
 MAX_WORD_DUR = 0.7
+
+# Word-timestamp repair (transcript-internal, no energy). Whisper's DTW onset can
+# hallucinate a LOW-confidence token's start backward into a pause; its char-offset
+# (which tiles within contiguous speech) is then the better onset. See
+# merge_tokens_to_words for the signed-direction re-anchor + char-contiguity merge.
+CONF_REANCHOR = 0.6     # only re-anchor tokens whisper itself flagged unsure
+CHAR_CONTIG_TOL = 0.06  # seconds — char-offsets tile (==) for true sub-word splits
 
 SENTENCE_END_RE = re.compile(r"[.!?…]+$")
 
@@ -60,9 +67,8 @@ CHUNK_SILENCE_MIN = 0.5     # seconds — min pause length to be a split candida
 def extract_audio(video: Path, audio: Path):
     """Whisper.cpp requires 16kHz mono WAV."""
     print("  extracting audio...")
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(video), "-ar", "16000", "-ac", "1", "-f", "wav", str(audio)],
-        check=True, stderr=subprocess.DEVNULL
+    run_ffmpeg(
+        ["ffmpeg", "-y", "-i", str(video), "-ar", "16000", "-ac", "1", "-f", "wav", str(audio)]
     )
 
 
@@ -81,21 +87,6 @@ def _run_whisper(audio: Path, captions_path: Path, model: str, lang: str) -> lis
         sys.exit(1)
     with open(captions_path, encoding="utf-8") as f:
         return json.load(f)
-
-
-def _detect_pauses(audio: Path) -> list[tuple[float, float]]:
-    """ffmpeg silencedetect → [(start, end), ...] pauses used as chunk split points.
-    Stricter threshold than the cut step so we only split in clear pauses."""
-    result = subprocess.run(
-        ["ffmpeg", "-i", str(audio),
-         "-af", f"silencedetect=noise={CHUNK_SILENCE_DB}dB:d={CHUNK_SILENCE_MIN}",
-         "-f", "null", "-"],
-        capture_output=True, text=True,
-    )
-    out = result.stderr
-    starts = [float(m) for m in re.findall(r"silence_start: ([\d.]+)", out)]
-    ends = [float(m) for m in re.findall(r"silence_end: ([\d.]+)", out)]
-    return list(zip(starts, ends))
 
 
 def plan_chunks(duration: float,
@@ -167,7 +158,9 @@ def transcribe_audio(audio: Path, model: str, lang: str) -> list[dict]:
               f"(model={model}, lang={lang}, {duration:.0f}s)...")
         return _run_whisper(audio, OUT_DIR / "whisper_captions.json", model, lang)
 
-    pauses = _detect_pauses(audio)
+    # Stricter threshold than the cut step so we only split in clear pauses.
+    pauses = silencedetect(audio, CHUNK_SILENCE_DB, CHUNK_SILENCE_MIN,
+                           total_duration=duration)
     chunks = plan_chunks(duration, pauses)
     print(f"  long audio ({duration:.0f}s) → {len(chunks)} chunk(s) "
           f"(~{CHUNK_TARGET_SEC:.0f}s, split at pauses; context reset each chunk)")
@@ -196,11 +189,10 @@ def transcribe_audio(audio: Path, model: str, lang: str) -> list[dict]:
                 continue
         print(f"  chunk {i + 1}/{len(chunks)}: {start:.1f}s–{end:.1f}s "
               f"({end - start:.1f}s)")
-        subprocess.run(
+        run_ffmpeg(
             ["ffmpeg", "-y", "-ss", f"{start:.3f}", "-t", f"{end - start:.3f}",
              "-i", str(audio), "-ar", "16000", "-ac", "1", "-f", "wav",
-             str(chunk_wav)],
-            check=True, stderr=subprocess.DEVNULL,
+             str(chunk_wav)]
         )
         captions = _offset_captions(_run_whisper(chunk_wav, chunk_json, model, lang),
                                     start)
@@ -244,6 +236,7 @@ def merge_tokens_to_words(captions: list[dict]) -> tuple[list[dict], list[dict]]
     depth = 0
     run_start = None
     run_end = None
+    prev_char_end = None  # char-offset end of the previous emitted token (for contiguity)
 
     def close_run():
         nonlocal run_start, run_end
@@ -274,20 +267,41 @@ def merge_tokens_to_words(captions: list[dict]) -> tuple[list[dict], list[dict]]
             dropped += 1
             continue
 
-        # A no-leading-space token normally continues the current word (sub-word
-        # split: 'mic'+'ró'+'f'+'ono', tokens milliseconds apart). But the FIRST
-        # token of a fresh chunk also has no leading space, so it would glue onto
-        # the previous chunk's last word — discarding its own DTW timestamp (this
-        # dropped "ciento veinte"→"120" by appending it to "Unos" as "Unos120").
-        # Guard: if a continuation token's DTW time is more than MAX_WORD_DUR past
-        # the current word's start, it belongs to a different utterance → new word.
-        ts = start_ms / 1000.0
+        # Two per-token clocks: dtw (DTW/attention onset, accurate across pauses)
+        # and chs/che (char-offset start/end, which TILE contiguously within a
+        # chunk). Word START is the DTW onset — EXCEPT when whisper flags the token
+        # low-confidence AND its DTW sits more than a word-length BEFORE its own
+        # char-offset: that is the hallucination-into-a-pause signature (e.g. a
+        # 0.48-conf token thrown 0.85s early into silence). Then trust the
+        # char-offset. SIGNED (chs - dtw), not abs: a token whose DTW is LATER than
+        # its char-offset is correctly placed after a real pause (first word after a
+        # gap) and must NOT be moved.
+        dtw = start_ms / 1000.0
+        chs = (c["startMs"] if c.get("startMs") is not None else start_ms) / 1000.0
+        che = (c["endMs"] if c.get("endMs") is not None
+               else c.get("startMs", start_ms)) / 1000.0
+        cf = c.get("confidence", 1.0)
+        ts = chs if (cf < CONF_REANCHOR and (chs - dtw) > MAX_WORD_DUR) else dtw
+
+        # A no-leading-space token continues the current word (sub-word split:
+        # 'mic'+'ró'+'f'+'ono'). The FIRST token of a fresh chunk also lacks a
+        # leading space, so it would glue onto the previous chunk's last word —
+        # discarding its own DTW (this dropped "ciento veinte"→"120" as "Unos120").
+        # The old guard split on a far DTW gap, but that also split a single word
+        # whose first token's DTW was hallucinated early ('implic'+'ar'→'implicar').
+        # Distinguish a real continuation from a chunk-seam glue by char-offset
+        # CONTIGUITY: char-offsets tile exactly within a chunk but jump across a
+        # chunk boundary. So only let a far gap force a new word when the token is
+        # NOT char-contiguous with the previous one.
+        char_contig = (prev_char_end is not None
+                       and abs(chs - prev_char_end) < CHAR_CONTIG_TOL)
         far = bool(words) and ts - words[-1]["start"] > MAX_WORD_DUR
-        starts_word = raw.startswith(" ") or not words or far
+        starts_word = raw.startswith(" ") or not words or (far and not char_contig)
         if starts_word:
             words.append({"word": raw.strip(), "start": ts})
         else:
             words[-1]["word"] += raw.strip()
+        prev_char_end = che
     close_run()  # in case a run never closed its bracket
 
     if dropped:

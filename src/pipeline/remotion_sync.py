@@ -6,12 +6,12 @@ Each processed project becomes a permanent Remotion composition. Per project we 
   - src/remotion/public/projects/<name>/images/*     (overlay images)
   - src/remotion/src/projects/<name>.json            (render-ready snapshot)
 
-Root.tsx is regenerated from the set of snapshot files: one <Composition> per
-project, grouped under a Studio <Folder> so the sidebar acts as the project
-switcher. Composition props (duration/dims/captions/overlays) are read from the
-imported snapshot json, so editing a snapshot updates that project without
-regenerating Root.tsx — regeneration is only needed when the SET of projects
-changes (a project is added or removed).
+Root.tsx discovers projects at runtime via require.context over ./projects/*.json
+(one <Composition> per snapshot, grouped under a Studio <Folder> so the sidebar acts
+as the project switcher). Root.tsx is therefore CONSTANT — adding or deleting a
+snapshot json changes the composition set on the next recompile with no Root.tsx
+regeneration needed. Composition props (duration/dims/captions/overlays) are read
+from the imported snapshot json, so editing a snapshot updates that project.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import json
 import shutil
 from pathlib import Path
 
-from config import REMOTION_DIR
+from config import REMOTION_DIR, DATA_ROOT, STATE_FILE
 
 
 def snapshot_dir(remotion_dir: Path = REMOTION_DIR) -> Path:
@@ -134,46 +134,55 @@ def list_projects(remotion_dir: Path = REMOTION_DIR) -> list[str]:
     return sorted(p.stem for p in d.glob("*.json"))
 
 
-def regenerate_root(remotion_dir: Path = REMOTION_DIR) -> None:
-    """Rewrite Root.tsx to register one <Composition> per snapshot json, grouped
-    under a Studio <Folder>. Values are read from the imported snapshots."""
-    names = list_projects(remotion_dir)
+# Constant Root.tsx. Projects are discovered at runtime from ./projects/*.json via
+# webpack require.context (Remotion's bundler is webpack), so this file never bakes
+# in a per-project import list: adding or deleting a snapshot json updates the Studio
+# sidebar on the next recompile, with no codegen and no dead import to crash the app.
+# require.context registers ./projects as a watched dependency, so deleting a json
+# triggers a live Fast Refresh and the composition drops from the sidebar. recursive
+# is false so sibling dirs (e.g. old scene folders) and .DS_Store are ignored.
+ROOT_TSX = '''import { Composition, Folder } from "remotion";
+import { VideoComposition } from "./Composition";
+import { compositionSchema, type CompositionProps } from "./schema";
 
-    imports = "\n".join(
-        f'import proj{i} from "./projects/{name}.json";' for i, name in enumerate(names)
-    )
-    array_items = ", ".join(f"proj{i}" for i in range(len(names)))
-
-    root_tsx = f'''import {{ Composition, Folder }} from "remotion";
-import {{ VideoComposition }} from "./Composition";
-import {{ compositionSchema, type CompositionProps }} from "./schema";
-{imports}
-
-type ProjectSnapshot = CompositionProps & {{
+type ProjectSnapshot = CompositionProps & {
   name: string;
   durationInFrames: number;
   width: number;
   height: number;
   fps: number;
-}};
+};
 
-const PROJECTS: ProjectSnapshot[] = [{array_items}] as unknown as ProjectSnapshot[];
+const ctx = (
+  require as unknown as {
+    context(
+      dir: string,
+      recursive: boolean,
+      regexp: RegExp,
+    ): { keys(): string[]; (id: string): unknown };
+  }
+).context("./projects", false, /\\.json$/);
 
-export const RemotionRoot: React.FC = () => {{
+const PROJECTS: ProjectSnapshot[] = ctx
+  .keys()
+  .sort()
+  .map((key) => ctx(key) as ProjectSnapshot);
+
+export const RemotionRoot: React.FC = () => {
   return (
     <Folder name="Projects">
-      {{PROJECTS.map((p) => (
+      {PROJECTS.map((p) => (
         <Composition
-          key={{p.name}}
-          id={{p.name}}
-          calculateMetadata={{() => ({{ defaultOutName: `${{p.name}}-edited` }})}}
-          component={{VideoComposition}}
-          durationInFrames={{p.durationInFrames}}
-          fps={{p.fps}}
-          width={{p.width}}
-          height={{p.height}}
-          schema={{compositionSchema}}
-          defaultProps={{{{
+          key={p.name}
+          id={p.name}
+          calculateMetadata={() => ({ defaultOutName: `${p.name}-edited` })}
+          component={VideoComposition}
+          durationInFrames={p.durationInFrames}
+          fps={p.fps}
+          width={p.width}
+          height={p.height}
+          schema={compositionSchema}
+          defaultProps={{
             project: p.name,
             videoSrc: p.videoSrc,
             videoVersion: p.videoVersion ?? 0,
@@ -181,22 +190,50 @@ export const RemotionRoot: React.FC = () => {{
             captions: p.captions,
             captionsEnabled: p.captionsEnabled ?? false,
             titleCards: p.titleCards,
-          }}}}
+          }}
         />
-      ))}}
+      ))}
     </Folder>
   );
-}};
+};
 '''
-    (remotion_dir / "src" / "Root.tsx").write_text(root_tsx, encoding="utf-8")
 
 
-def delete_project(name: str, remotion_dir: Path = REMOTION_DIR) -> None:
-    """Remove a project's Remotion snapshot + public assets, then regenerate Root."""
+def regenerate_root(remotion_dir: Path = REMOTION_DIR) -> None:
+    """Write the constant dynamic Root.tsx (see ROOT_TSX). The composition set is
+    discovered at runtime via require.context, so this content never varies with the
+    project list — kept as a function (not a static file) so a fresh checkout and
+    `project.py rebuild` can (re)create it. Callers (steps 4/4b, delete) keep working;
+    each call is a harmless idempotent rewrite."""
+    (remotion_dir / "src" / "Root.tsx").write_text(ROOT_TSX, encoding="utf-8")
+
+
+def delete_project(name: str, remotion_dir: Path = REMOTION_DIR) -> list[str]:
+    """Remove ALL of a project's files and regenerate Root.tsx. Idempotent — missing
+    pieces are skipped. Returns the list of removed paths. Wipes, for project <name>:
+      - src/data/<name>/                       (pipeline intermediates)
+      - src/remotion/src/projects/<name>.json  (render-ready snapshot)
+      - src/remotion/public/projects/<name>/   (edited.mp4 + overlay images)
+    Clears the active-project state file if it pointed at <name>."""
+    removed: list[str] = []
+
+    data_dir = DATA_ROOT / name
+    if data_dir.exists():
+        shutil.rmtree(data_dir)
+        removed.append(str(data_dir))
+
     snap = snapshot_path(name, remotion_dir)
     if snap.exists():
         snap.unlink()
+        removed.append(str(snap))
+
     pub = public_project_dir(name, remotion_dir)
     if pub.exists():
         shutil.rmtree(pub)
+        removed.append(str(pub))
+
+    if STATE_FILE.exists() and STATE_FILE.read_text(encoding="utf-8").strip() == name:
+        STATE_FILE.unlink()
+
     regenerate_root(remotion_dir)
+    return removed

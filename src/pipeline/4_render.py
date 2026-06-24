@@ -9,19 +9,46 @@ Usage:
 
 import subprocess
 import json
+import socket
 import sys
 import time
 import argparse
 from pathlib import Path
 from config import (
     OUT_DIR, OUTPUT_DIR, REMOTION_DIR, IMAGES_DIR, ACTIVE_PROJECT,
-    VIDEO_FPS, FFMPEG_AAC_STEREO_ARGS, get_mode,
+    VIDEO_FPS, FFMPEG_AAC_STEREO_ARGS, SIDECAR_PORT, get_mode, run_ffmpeg,
     seconds_to_frame, frames_to_ms,
 )
 from captions_config import (
     MAX_WORDS_PER_CAPTION, MAX_CHARS_PER_CAPTION, MIN_CAPTION_DURATION_MS,
 )
-from remotion_sync import write_project_snapshot, regenerate_root
+from remotion_sync import write_project_snapshot, regenerate_root, read_snapshot
+
+
+def _port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("127.0.0.1", port)) != 0
+
+
+def snap_keep_to_frames(keep: list[dict], fps: int = VIDEO_FPS) -> list[dict]:
+    """Quantize keep-segment boundaries to the fps grid.
+
+    The cut filtergraph trims video on the frame grid (whole frames only) but audio
+    sample-exact (atrim). On float-second boundaries each segment's video duration
+    rounds to a whole frame while its audio stays exact, so concat stacks two slightly
+    different per-segment lengths — the mismatch random-walks across cuts into visible
+    A/V drift (worse the more cuts there are). Snapping both boundaries to k/fps makes
+    each segment's video frame-count and audio duration identical (at 44.1 kHz / 30 fps
+    a frame is exactly 1470 samples, so a frame boundary is also a sample boundary), so
+    video, audio, and the subtitle timeline (built from this same list) stay locked.
+    """
+    snapped = []
+    for seg in keep:
+        s = round(seg["start"] * fps) / fps
+        e = round(seg["end"] * fps) / fps
+        if round(e * fps) > round(s * fps):  # drop any sub-frame segment
+            snapped.append({**seg, "start": s, "end": e})
+    return snapped
 
 
 def cut_video(combined: Path, keep: list[dict], out: Path):
@@ -63,7 +90,11 @@ def cut_video(combined: Path, keep: list[dict], out: Path):
         # 1080p clips at that level are rejected by chromium/WebCodecs
         # (@remotion/media) as an unsupported format even though ffmpeg plays them.
         "-c:v", "libx264", "-profile:v", "high", "-level", "4.2",
-        "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+        # Intermediate cut: crf 18 locks quality; preset only trades encode
+        # time vs file size (NOT quality). veryfast ~1.5-2x faster than fast
+        # with all quality tools intact. Stay >= veryfast — superfast/ultrafast
+        # disable CABAC/psy tools and do degrade quality.
+        "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
         # Force constant 30fps. The concat filter can emit variable frame timing
         # (avg_frame_rate != 30), which WebCodecs also rejects as a format error.
         "-r", str(VIDEO_FPS), "-vsync", "cfr",
@@ -71,7 +102,7 @@ def cut_video(combined: Path, keep: list[dict], out: Path):
         *FFMPEG_AAC_STEREO_ARGS,
         str(out)
     ]
-    subprocess.run(cmd, check=True, stderr=subprocess.DEVNULL)
+    run_ffmpeg(cmd)
 
 
 def build_subtitles(transcript: dict, keep: list[dict]) -> list[dict]:
@@ -182,17 +213,11 @@ def build_subtitles(transcript: dict, keep: list[dict]) -> list[dict]:
     ]
 
 
-def update_remotion(edited_video: Path, subtitles: list[dict],
-                    duration_frames: int, mode: dict,
-                    no_subtitles: bool = False, no_title: bool = False):
-    """Write this project's render-ready snapshot into the multi-tenant Remotion
-    store (public/projects/<name>/ + src/projects/<name>.json) and regenerate
-    Root.tsx so every project is a registered composition.
-    no_subtitles / no_title override mode-based defaults to force-disable each feature."""
-    # Always store the transcript as captions so the Studio "Subtitles" tab shows
-    # it for every project (incl. youtube). captions_enabled controls only whether
-    # they render burned onto the video.
-    captions = [
+def subtitles_to_captions(subtitles: list[dict]) -> list[dict]:
+    """Convert build_subtitles() output (frame-based) to snapshot captions (ms).
+    Always stored — even in youtube mode — so the Studio Subtitles tab is populated
+    everywhere; captions_enabled gates only the burned-in render."""
+    return [
         {
             "startMs": frames_to_ms(s["start"]),
             "endMs":   frames_to_ms(s["end"]),
@@ -205,9 +230,33 @@ def update_remotion(edited_video: Path, subtitles: list[dict],
         }
         for s in subtitles
     ]
-    captions_enabled = mode["subtitles"] and not no_subtitles
+
+
+def update_remotion(edited_video: Path, captions: list[dict],
+                    duration_frames: int, mode: dict,
+                    no_subtitles: bool = False, no_title: bool = False):
+    """Write this project's render-ready snapshot into the multi-tenant Remotion
+    store (public/projects/<name>/ + src/projects/<name>.json) and regenerate
+    Root.tsx so every project is a registered composition. `captions` is the final
+    ms-based caption list (freshly derived, or re-mapped through a re-cut).
+    no_subtitles / no_title override mode-based defaults to force-disable each feature."""
+    # on-video subtitles ("Display on video"): a per-project toggle that must survive
+    # reloads AND re-cuts. --no-subtitles force-disables; otherwise preserve the value
+    # already in the snapshot (the Subtitles tab's toggle persisted it via the sidecar);
+    # only a brand-new project with no snapshot falls back to the mode default
+    # (reel → on, youtube → off).
+    prev_snap = read_snapshot(ACTIVE_PROJECT)
+    prior_enabled = prev_snap.get("captionsEnabled") if prev_snap else None
+    if no_subtitles:
+        captions_enabled = False
+        reason = "--no-subtitles flag"
+    elif prior_enabled is not None:
+        captions_enabled = bool(prior_enabled)
+        reason = "prior toggle"
+    else:
+        captions_enabled = mode["subtitles"]
+        reason = f"mode: {mode['mode']}"
     if not captions_enabled:
-        reason = "--no-subtitles flag" if no_subtitles else f"mode: {mode['mode']}"
         print(f"  on-video subtitles disabled ({reason}); "
               f"transcript still available in the Studio Subtitles tab")
 
@@ -331,6 +380,124 @@ def subtract_drops(keep: list[dict], cut_indices: set[int],
     return new_keep
 
 
+def drop_wordless_segments(keep: list[dict], transcript: dict) -> list[dict]:
+    """Drop keep segments that contain no transcript word.
+
+    A kept segment carries ±0.1s of pad around its speech. When a carve
+    (subtract_drops) removes the boundary caption of a cut, the pad on that side
+    survives as a tiny word-less sliver (e.g. dropping a cut's FIRST caption leaves
+    the leading pad [seg.start, first_word.start]). That sliver would otherwise
+    register as a phantom kept segment — an extra "Cut" that shifts every later
+    cutIndex, so a dropped first/last line appears to split its cut and mis-mark a
+    neighbour. Keep segments only ever hold speech blocks, so a word-less one is
+    always such an artifact; remove it. (A mid-line delete still splits a cut into
+    two word-ful halves — that is by design and untouched here.)
+
+    Membership test is the word's MIDPOINT, not its start: frame-snapping can
+    stretch a leading-pad sliver just past the first word's start, so it clips a few
+    ms of that word's edge — a start-inside test would wrongly keep it. The midpoint
+    lands in the real speech remnant, never in the pad sliver."""
+    mids = [
+        (w["start"] + w["end"]) / 2.0
+        for seg in transcript.get("segments", [])
+        for w in (seg.get("words") or []) if "start" in w and "end" in w
+    ]
+    return [
+        seg for seg in keep
+        if any(seg["start"] <= mid < seg["end"] for mid in mids)
+    ]
+
+
+def captions_match_keep(prev_caps: list[dict], old_keep: list[dict]) -> bool:
+    """True if the captions plausibly belong to `old_keep`'s edited timeline, so
+    re-mapping them through a cut is safe. Catches a stale Studio store (captions
+    from a since-rebuilt/longer timeline): a cutIndex past the segment count, or a
+    caption ending well beyond the total edited duration. Tolerant of small
+    overshoot (MIN_CAPTION_DURATION extension, manual time edits)."""
+    if not old_keep:
+        return False
+    n = len(old_keep)
+    total_ms = sum(s["end"] - s["start"] for s in old_keep) * 1000.0
+    for c in prev_caps:
+        ci = c.get("cutIndex")
+        if ci is not None and not (0 <= ci < n):
+            return False
+        if float(c.get("endMs", 0)) > total_ms + 1500:
+            return False
+    return True
+
+
+def remap_captions(prev_caps: list[dict], old_keep: list[dict],
+                   new_keep: list[dict], cut_indices: set[int],
+                   ranges_ms: list[tuple[float, float]]) -> list[dict]:
+    """Re-time persisted (edited) captions through a re-cut, preserving manual
+    text/split/merge edits instead of re-deriving them from the transcript.
+
+    Every deletion (a dropped cut or a dropped line) aligns to whole captions, so
+    each surviving caption is fully outside the removed edited-time intervals —
+    re-timing is a pure left-shift by the dropped time before it. cutIndex is
+    recomputed against the new keep segmentation (auto-renumbers; a mid-cut line
+    delete that splits a segment is reflected). Times are EDITED-time ms."""
+    # Old-edited offsets (seconds) per keep segment → removed intervals R (ms).
+    old_off, cur = [], 0.0
+    for seg in old_keep:
+        old_off.append(cur)
+        cur += seg["end"] - seg["start"]
+    removed: list[tuple[float, float]] = []
+    for c in cut_indices:
+        if 0 <= c < len(old_keep):
+            removed.append((old_off[c] * 1000.0,
+                            (old_off[c] + (old_keep[c]["end"] - old_keep[c]["start"])) * 1000.0))
+    removed.extend((float(s), float(e)) for s, e in ranges_ms)
+    removed.sort()
+
+    def removed_before(t: float) -> float:
+        return sum(max(0.0, min(t, b) - a) for a, b in removed)
+
+    def overlaps_removed(s: float, e: float) -> bool:
+        # Any overlap with a dropped interval → the caption is gone. Aligned drops
+        # make this all-or-nothing; the overlap form also stays correct if a manual
+        # time-edit left a caption straddling a boundary (it's dropped, not mis-shifted).
+        return any(not (e <= a or s >= b) for a, b in removed)
+
+    # New-edited bounds (ms) per keep segment, for cutIndex recomputation. Rounded to
+    # whole ms: the boundaries are a running sum of float durations, so a clean 1100 ms
+    # cut surfaces as 1100.0000000000005. An integer compare keeps a caption that starts
+    # EXACTLY at a splice on the LATER cut (via a<=t<b) — correct, the first caption after
+    # a splice belongs to the new cut — instead of the float tail pulling it back one cut.
+    new_bounds, cur = [], 0.0
+    for seg in new_keep:
+        dur = seg["end"] - seg["start"]
+        a = round(cur * 1000.0)
+        cur += dur
+        new_bounds.append((a, round(cur * 1000.0)))
+
+    def cut_index_for(t_ms: float) -> int:
+        t = round(t_ms)
+        for i, (a, b) in enumerate(new_bounds):
+            if a <= t < b:
+                return i
+        return max(0, len(new_bounds) - 1)  # clamp rounding at the very end
+
+    out: list[dict] = []
+    for cap in prev_caps:
+        s, e = float(cap["startMs"]), float(cap["endMs"])
+        if overlaps_removed(s, e):  # any part cut → caption gone
+            continue
+        shift = removed_before(s)  # == removed_before(e): caption is outside R
+        out.append({
+            "startMs": s - shift,
+            "endMs": e - shift,
+            "text": cap.get("text", ""),
+            "cutIndex": cut_index_for(s - shift),
+            "words": [
+                {"startMs": float(w["startMs"]) - shift, "endMs": float(w["endMs"]) - shift}
+                for w in (cap.get("words") or [])
+            ],
+        })
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--render", action="store_true", help="Render final MP4 instead of opening Studio")
@@ -344,6 +511,10 @@ def main():
     parser.add_argument("--drop-ranges", default=None,
                         help="Comma-separated edited-time ranges 'startMs-endMs' to carve out of the "
                              "video (single-caption deletes). Combined with --drop-cuts in one pass.")
+    parser.add_argument("--no-open", action="store_true",
+                        help="Regenerate edited.mp4 + snapshot in place, then exit WITHOUT opening "
+                             "Studio (it's already running; HMR reloads). Used by the Subtitles-tab "
+                             "Fix button to repair a corrupt project.")
     args = parser.parse_args()
 
     edit_plan_path = OUT_DIR / "edit_plan.json"
@@ -360,6 +531,7 @@ def main():
     # recompute duration, and persist the reduced plan so successive drops compose
     # (and tab cutIndex keeps matching keep). combined.mp4 persists, so re-cutting
     # is always possible.
+    captions: list[dict] | None = None
     if args.drop_cuts or args.drop_ranges:
         cut_indices = {int(i) for i in (args.drop_cuts or "").split(",") if i.strip() != ""}
         ranges_ms: list[tuple[float, float]] = []
@@ -369,39 +541,77 @@ def main():
                 continue
             s, e = r.split("-")
             ranges_ms.append((float(s), float(e)))
-        plan["keep"] = subtract_drops(plan["keep"], cut_indices, ranges_ms)
-        if not plan["keep"]:
+        # Snap the keep to the frame grid ONCE here as the single source of truth: the
+        # persisted keep, the cutIndex bounds in remap_captions, and cut_video below all
+        # bucket against the SAME frame-aligned cut points. cutIndex must align to where
+        # the video is actually spliced (frame grid); computing it on an unsnapped keep
+        # while the video is cut on a snapped one lets a caption starting at a splice land
+        # on the wrong cut. old_keep is snapped too so the shift math matches the caption
+        # timeline (captions were timed against the prior snapped keep).
+        old_keep = snap_keep_to_frames(list(plan["keep"]))
+        new_keep = subtract_drops(old_keep, cut_indices, ranges_ms)
+        # A carve that trims a cut down to its leading/trailing pad leaves a
+        # word-less sliver; drop it so it doesn't become a phantom cut that shifts
+        # every later cutIndex (dropped first/last line splitting its cut).
+        new_keep = drop_wordless_segments(new_keep, plan["transcript"])
+        new_keep = snap_keep_to_frames(new_keep)
+        if not new_keep:
             print("ERROR: requested deletions would remove every segment; aborting.")
             sys.exit(1)
-        plan["final_duration"] = sum(k["end"] - k["start"] for k in plan["keep"])
+        plan["keep"] = new_keep
+        plan["final_duration"] = sum(k["end"] - k["start"] for k in new_keep)
         with open(edit_plan_path, "w", encoding="utf-8") as f:
             json.dump(plan, f, ensure_ascii=False, indent=2)
         print(f"  removed {len(cut_indices)} cut(s) + {len(ranges_ms)} line(s); "
-              f"{len(plan['keep'])} segment(s) remain")
+              f"{len(new_keep)} segment(s) remain")
 
-    keep = plan["keep"]
+        # Preserve manual caption edits (text/splits/merges) by re-mapping the
+        # persisted snapshot captions through the cut instead of re-deriving them —
+        # but ONLY if those captions are consistent with the current keep. A stale
+        # Studio store (e.g. captions from a since-rebuilt timeline) would otherwise
+        # be re-mapped into garbage and desync from the video; in that case discard
+        # them and fall back to a clean re-derive (manual edits lost, but the cut is
+        # correct and the snapshot self-heals).
+        prev = read_snapshot(ACTIVE_PROJECT)
+        prev_caps = (prev or {}).get("captions")
+        if prev_caps and captions_match_keep(prev_caps, old_keep):
+            captions = remap_captions(prev_caps, old_keep, new_keep, cut_indices, ranges_ms)
+            print(f"  re-mapped {len(captions)} caption(s) through the cut (edits preserved)")
+        elif prev_caps:
+            print("  ⚠ snapshot captions inconsistent with the cut (stale Studio store?) — "
+                  "re-deriving from transcript")
+
+    # Snap cut boundaries to the frame grid so the frame-domain video cut and the
+    # sample-domain audio cut land on identical boundaries — feeds cut_video AND
+    # build_subtitles from one frame-aligned list so picture, voice, and captions
+    # stay locked (no per-cut A/V drift that grows with the number of cuts).
+    keep = snap_keep_to_frames(plan["keep"])
     combined = OUT_DIR / "combined.mp4"
     edited = OUT_DIR / "edited.mp4"
 
     cut_video(combined, keep, edited)
 
-    final_duration = plan["final_duration"]
+    # Recompute from the snapped keep so the composition length matches the
+    # frame-aligned edited.mp4 exactly (plan["final_duration"] used unsnapped bounds).
+    final_duration = sum(seg["end"] - seg["start"] for seg in keep)
     duration_frames = round(final_duration * VIDEO_FPS)
-    # Always build subtitles (transcript mapped to the edited timeline) so the
-    # Studio "Subtitles" tab is populated for every mode; on-video display is gated
-    # separately by captions_enabled inside update_remotion.
-    subtitles = build_subtitles(plan["transcript"], keep)
+    # Fresh derive when there are no persisted captions to preserve (initial run, or
+    # a full rebuild). Always stored — even youtube — so the Subtitles tab is
+    # populated; captions_enabled gates only the burned-in render.
+    if captions is None:
+        captions = subtitles_to_captions(build_subtitles(plan["transcript"], keep))
 
-    update_remotion(edited, subtitles, duration_frames, mode,
+    update_remotion(edited, captions, duration_frames, mode,
                     no_subtitles=args.no_subtitles, no_title=args.no_title)
 
     print(f"\n✅ Edited video ready: {edited}")
     print(f"   Duration: {final_duration:.1f}s | {duration_frames} frames")
-    print(f"   Subtitles: {len(subtitles)} entries")
+    print(f"   Subtitles: {len(captions)} entries")
 
-    # Sidecar path: files updated, Studio is already running (HMR reloads). Done.
-    if args.drop_cuts:
-        print("   (--drop-cuts: snapshot updated; Studio will hot-reload)")
+    # Sidecar / Fix path: files updated, Studio is already running (HMR reloads). Done.
+    if args.drop_cuts or args.no_open:
+        reason = "--drop-cuts" if args.drop_cuts else "--no-open"
+        print(f"   ({reason}: snapshot updated; Studio will hot-reload)")
         return
 
     if args.render:
@@ -417,7 +627,23 @@ def main():
     else:
         print("\n  opening Remotion Studio for preview...")
         print("  (Ctrl+C to stop, then run with --render to export)")
-        subprocess.run(["npm", "run", "dev"], cwd=REMOTION_DIR)
+        # Bring up the sidecar (cut/edit doorbell) so the Subtitles tab's Apply works
+        # out of the box — but only if one isn't already serving 9848. Studio opens
+        # solo (dev:studio); the sidecar we spawn is torn down when Studio exits.
+        # (Not `npm run dev`: that bundles both via concurrently --kill-others, which
+        # would take Studio down if the bundled sidecar hit a port clash.)
+        sidecar_proc = None
+        if _port_free(SIDECAR_PORT):
+            print(f"  starting sidecar on :{SIDECAR_PORT}")
+            sidecar_proc = subprocess.Popen([sys.executable, "sidecar.py"],
+                                            cwd=Path(__file__).parent)
+        else:
+            print(f"  sidecar already running on :{SIDECAR_PORT} — reusing it")
+        try:
+            subprocess.run(["npm", "run", "dev:studio"], cwd=REMOTION_DIR)
+        finally:
+            if sidecar_proc:
+                sidecar_proc.terminate()
 
 
 if __name__ == "__main__":

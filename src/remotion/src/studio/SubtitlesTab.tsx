@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import type { CaptionSegment } from "../schema";
+import { activeCaptionIndex } from "../caption-utils";
 
 // Studio-chrome panel: the selected composition's transcript, grouped by cut,
 // with inline editing + a "display on video" toggle. Mounted into Remotion
@@ -115,6 +116,12 @@ const switchKnob = (on: boolean): React.CSSProperties => ({
 const list: React.CSSProperties = {
   flex: 1,
   overflowY: "scroll", // permanent scrollbar (styled via .ve-cap-list below)
+  // Studio's bottom controls bar (Render + video controls) overlays the panel
+  // bottom. marginBottom ends the WHOLE scroll box — content AND scrollbar — above
+  // it, so neither the last caption nor the scrollbar slips under the bar (mirrors
+  // how the video preview stops above it). Use margin, not padding: padding leaves
+  // the element full-height so the scrollbar would still run under the bar.
+  marginBottom: 39,
 };
 
 const emptyState: React.CSSProperties = {
@@ -129,9 +136,7 @@ const emptyState: React.CSSProperties = {
 };
 
 const cutHeader: React.CSSProperties = {
-  position: "sticky",
   top: 0,
-  zIndex: 1,
   display: "flex",
   alignItems: "center",
   justifyContent: "space-between",
@@ -156,9 +161,15 @@ const row: React.CSSProperties = {
   alignItems: "baseline",
 };
 
+// Shared width: the display timestamp slot and the edit-mode left label use the
+// SAME width, so the caption text input lands at the exact x of the display text —
+// clicking to edit never shifts the text horizontally.
+const LEFT_COL = 54;
+
 // Timestamp = click-to-seek; accent blue, pointer.
 const timestamp: React.CSSProperties = {
   flexShrink: 0,
+  width: LEFT_COL,
   fontVariantNumeric: "tabular-nums",
   fontFamily: "monospace",
   fontSize: 12,
@@ -176,55 +187,118 @@ const text: React.CSSProperties = {
 };
 
 // ── Inline edit styling ───────────────────────────────────────────────────────
-const editWrap: React.CSSProperties = {
+// Edit-mode row. Since the text itself gets no box, the row carries the whole
+// "this line is being edited" affordance: a stronger tint + a left accent bar
+// (inset box-shadow, like the active-caption highlight). Padding matches the display
+// row so row 1 (the text) starts at the same y.
+const editRow: React.CSSProperties = {
   display: "flex",
   flexDirection: "column",
-  gap: 8,
-  padding: "8px 12px",
+  gap: 6,
+  padding: "6px 12px",
   borderBottom: "1px solid rgba(255,255,255,0.07)",
-  background: "rgba(11,132,243,0.08)",
+  background: "rgba(11,132,243,0.12)",
+  boxShadow: "inset 3px 0 0 #0b84f3",
 };
 
-const input: React.CSSProperties = {
+// One inner line of the edit box. Row 1 = text, row 2 = clocks + split/merge.
+const editLine: React.CSSProperties = {
+  display: "flex",
+  gap: 10,
+  alignItems: "center",
+};
+
+// Left label fills LEFT_COL (== the display timestamp width) so the text input
+// starts at the same x as the display text — no horizontal jump on edit.
+// Extra space between a label word and its box — bump this to widen the label→box
+// gap. Added as the label's right padding (inside the fixed-width column), so it
+// pushes the WORD left without moving the boxes or the caption text.
+const LABEL_BOX_GAP = 5;
+const editLeftLabel: React.CSSProperties = {
+  flexShrink: 0,
+  width: LEFT_COL,
+  paddingRight: LABEL_BOX_GAP,
+  // Right-align so the label word hugs the right edge of its fixed-width column.
+  // Otherwise (left-aligned) the trailing empty space differs by word length, so
+  // "TEXT" would sit further from its box than "START" — the word→box gap must be
+  // equal across all three labels.
+  textAlign: "right",
+  fontFamily: "monospace",
+  fontSize: 12, // match the display timestamp's height
+  fontWeight: 600,
+  letterSpacing: 0.6,
+  textTransform: "uppercase",
+  color: "#A6A7A9",
+  userSelect: "none",
+};
+
+const inlineLabel: React.CSSProperties = {
+  flexShrink: 0,
+  paddingRight: LABEL_BOX_GAP,
+  fontFamily: "monospace",
+  fontSize: 12, // match the display timestamp's height
+  fontWeight: 600,
+  letterSpacing: 0.6,
+  textTransform: "uppercase",
+  color: "#A6A7A9",
+  userSelect: "none",
+};
+
+// THE RULE: the caption text must occupy the exact same position + size whether the
+// line is in display or edit mode. We DO want a visible box here, so to keep the text
+// off the box frame without moving it we pad the box AND shift the box left by that
+// same padding:
+//   • padding-left TEXT_PAD_X gives the text breathing room inside the box;
+//   • margin-left -TEXT_PAD_X pulls the whole box left by the same amount, so the
+//     text glyph returns to the exact x of the display `text` span (net shift = 0);
+//   • the border is drawn with box-shadow (no layout space) so the only offset to
+//     cancel is the padding — margin = -padding, exactly;
+//   • horizontal padding only — vertical breathing comes from line-height (1.5), so
+//     the text's y is untouched;
+//   • NO font props → 16px/1.5/Arial from `.css-reset` = the display line's size.
+// The box bleeds TEXT_PAD_X left into the 10px label gap (→ 4px clearance).
+const TEXT_PAD_X = 6;
+const editTextInput: React.CSSProperties = {
+  flex: 1,
+  minWidth: 0,
+  padding: `0 ${TEXT_PAD_X}px`,
+  margin: `0 0 0 -${TEXT_PAD_X}px`,
+  border: "none",
+  outline: "none",
+  borderRadius: 0, // square, matching the other UI boxes
+  background: "#1e1e1e",
+  color: "#fff",
+  boxShadow: "0 0 0 1px #444", // 1px border look, same color as the clock boxes
+};
+
+const editClock: React.CSSProperties = {
+  width: 96,
+  // Flat 1px border (NO box-shadow) so the boxes look flush, not raised/recessed.
+  // A real border sits 1px INSIDE the box, whereas the text box's box-shadow sits
+  // OUTSIDE its border-box — so bleed left by TEXT_PAD_X + 1 (the extra border px) to
+  // land the visible 1px line AND the value at the same x as the text box. textAlign
+  // left so the value never reads as right-shifted. padding "2px Npx" → height 24px
+  // (12px line 18 + 4 pad + 2 border) = text box; horizontal gap = TEXT_PAD_X.
+  margin: `0 0 0 -${TEXT_PAD_X + 1}px`,
   background: "#1e1e1e",
   border: "1px solid #444",
   borderRadius: 0,
   color: "#fff",
-  padding: "8px 10px",
-  fontSize: 13,
-  fontFamily: "inherit",
-  width: "100%",
+  textAlign: "left",
+  padding: `2px ${TEXT_PAD_X}px`,
+  fontSize: 12,
+  fontFamily: "monospace",
   boxSizing: "border-box",
   outline: "none",
 };
 
-const msInput: React.CSSProperties = {
-  ...input,
-  fontFamily: "monospace",
-  width: 110,
-};
-
-const fieldLabel: React.CSSProperties = {
-  fontFamily: "monospace",
-  fontSize: 10,
-  color: "#A6A7A9",
-  fontWeight: 600,
-  letterSpacing: 0.6,
-  textTransform: "uppercase",
-  marginBottom: 2,
-  display: "block",
-};
-
-const btn = (variant: "save" | "cancel"): React.CSSProperties => ({
-  border: variant === "save" ? "none" : "1px solid #444",
-  background: variant === "save" ? "#3aa657" : "transparent",
-  color: variant === "save" ? "#06210f" : "#aaa",
-  fontWeight: 700,
-  fontSize: 12,
-  borderRadius: 0,
-  padding: "6px 14px",
+const delBtn: React.CSSProperties = {
+  flexShrink: 0,
   cursor: "pointer",
-});
+  userSelect: "none",
+  fontWeight: 700,
+  color: "#c0392b",
+};
 
 // Apply button styled like a Props SegmentedControl segment: bordered, muted when
 // idle (no pending deletions), filled #2f363d + white when there's something to apply.
@@ -241,7 +315,36 @@ const applyBtn = (active: boolean, busy: boolean): React.CSSProperties => ({
   opacity: busy ? 0.6 : 1,
 });
 
-const SIDECAR_URL = "http://127.0.0.1:9848/apply-cuts";
+const SIDECAR_BASE = "http://127.0.0.1:9848";
+const SIDECAR_URL = `${SIDECAR_BASE}/apply-cuts`;
+const HEALTH_URL = `${SIDECAR_BASE}/project-health`;
+const FIX_URL = `${SIDECAR_BASE}/fix`;
+const SAVE_URL = `${SIDECAR_BASE}/save-captions`;
+
+// Split (`][`) + merge (`⬆ ⬇`) buttons in the edit row. Muted when disabled.
+// Sized to the text box height (24px): font 12 line 18 + 4 pad + 2 border.
+const toolBtn = (enabled: boolean): React.CSSProperties => ({
+  border: "1px solid #444",
+  background: "transparent",
+  color: enabled ? "#cfd2d4" : "#5a5e62",
+  fontWeight: 700,
+  fontSize: 12,
+  fontFamily: "monospace",
+  borderRadius: 0,
+  padding: "2px 8px",
+  cursor: enabled ? "pointer" : "default",
+});
+
+// Caret-driven split point: number of words before the caret, or null if the
+// caret isn't on a whitespace boundary with at least one word on each side.
+const splitAt = (text: string, caret: number): number | null => {
+  if (caret <= 0 || caret >= text.length) return null;
+  if (!/\s/.test(text[caret - 1]) && !/\s/.test(text[caret])) return null;
+  const before = text.slice(0, caret).split(/\s+/).filter(Boolean);
+  const after = text.slice(caret).split(/\s+/).filter(Boolean);
+  if (before.length === 0 || after.length === 0) return null;
+  return before.length;
+};
 
 type Group = {
   cutIndex: number | null;
@@ -264,6 +367,25 @@ const groupByCut = (captions: CaptionSegment[]): Group[] => {
   return groups;
 };
 
+// ── Session-scoped pending-deletion store ────────────────────────────────────
+// Pending deletion marks (whole cuts + single lines) are STAGING state: they must
+// live for the Studio session and die on a full page reload. A re-cut reloads, so
+// a fresh page must NEVER resurrect a mark. A module-level per-project store gives
+// exactly that lifetime — it survives a tab switch (Props↔Subtitles unmounts the
+// component but the module stays loaded) yet a reload re-evaluates this module and
+// starts empty.
+//
+// This replaces a localStorage mirror. localStorage persisted ACROSS reloads and,
+// because marks are keyed by caption ARRAY INDEX, a stale `{lines:[0]}` was
+// resurrected onto whatever caption then sat at index 0 after a cut — the "deleted
+// line's mark jumps to the next line after Apply" bug, sticky across hard reloads
+// (a reload never clears localStorage). We no longer read the old `ve-pending-*`
+// keys, so any existing poison is inert.
+type Pending = { drops: Set<number>; lines: Set<number> };
+const pendingStore = new Map<string, Pending>();
+const getPending = (project: string | null): Pending =>
+  (project && pendingStore.get(project)) || { drops: new Set(), lines: new Set() };
+
 export const SubtitlesTab: React.FC<{
   defaultProps?: Record<string, unknown>;
   setDefaultProps?: SetDefaultProps;
@@ -275,14 +397,50 @@ export const SubtitlesTab: React.FC<{
   const [draftText, setDraftText] = useState("");
   const [draftStart, setDraftStart] = useState("");
   const [draftEnd, setDraftEnd] = useState("");
+  const [draftCaret, setDraftCaret] = useState(0);
+  const persistTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Delete staging (whole cuts + single lines) ──────────────────────────────
+  // Pending deletions are PER-PROJECT and must stay independent across projects.
+  // Backed by the module-level `pendingStore` (top of file): survives a tab-switch
+  // remount but resets on a full page reload. Two lifecycles:
+  //   • Tab switch (Props/Renders/Subtitles) unmounts this component → the lazy
+  //     useState initializers re-read the store on remount → marks survive.
+  //   • Project switch while staying on the Subtitles tab does NOT remount (same
+  //     position, props just change), so state must be reset the instant `project`
+  //     changes. We do it DURING RENDER (React's "adjust state when a prop changes"
+  //     idiom) — synchronous, before any effect runs.
   const project = typeof defaultProps?.project === "string" ? defaultProps.project : null;
-  const [pendingDrops, setPendingDrops] = useState<Set<number>>(new Set()); // cut indices
-  const [pendingLines, setPendingLines] = useState<Set<number>>(new Set()); // caption indices
+
+  const [pendingDrops, setPendingDrops] = useState<Set<number>>(
+    () => new Set(getPending(project).drops)
+  );
+  const [pendingLines, setPendingLines] = useState<Set<number>>(
+    () => new Set(getPending(project).lines)
+  );
+
+  // Reset-on-project-switch. Guarded so it fires only when `project` actually
+  // changed (no render loop). Reads the NEW project's store entry, so a fresh
+  // project starts empty and a revisited one restores its own marks.
+  const [trackedProject, setTrackedProject] = useState(project);
+  if (project !== trackedProject) {
+    setTrackedProject(project);
+    setPendingDrops(new Set(getPending(project).drops));
+    setPendingLines(new Set(getPending(project).lines));
+    setEditingIndex(null);
+  }
+
   const [applying, setApplying] = useState(false);
   const [applyError, setApplyError] = useState<string | null>(null);
   const pendingCount = pendingDrops.size + pendingLines.size;
+  const [progress, setProgress] = useState(0);
+  const applySuccessRef = useRef(false);
+
+
+  // ── Project health (corrupt-file detection + Fix) ───────────────────────────
+  const [health, setHealth] = useState<{ corrupt: boolean; resumeStep: number | null } | null>(null);
+  const [fixing, setFixing] = useState(false);
+  const busy = applying || fixing;
 
   // ── Auto-scroll (follow the playhead) ───────────────────────────────────────
   // The playhead arrives via window.__veSubtitleFrame, published by FrameBridge
@@ -292,8 +450,10 @@ export const SubtitlesTab: React.FC<{
   const editingRef = useRef(false);
   const captionsRef = useRef(captions);
   const lastManualScrollRef = useRef(0);
+  const busyRef = useRef(busy);
   captionsRef.current = captions;
   editingRef.current = editingIndex !== null;
+  busyRef.current = busy;
 
   // Manual scroll stops following. It re-arms once the active line is back in
   // view and the user has been idle for a moment (handled in the rAF loop).
@@ -322,6 +482,7 @@ export const SubtitlesTab: React.FC<{
     let lastChange = 0;
     let prevActiveEl: HTMLElement | null = null;
     let centeredForActive = -1;
+    let handledEditNonce = -1;
     const tick = () => {
       const bridge = (window as Window & {
         __veSubtitleFrame?: { frame: number; fps: number };
@@ -350,14 +511,7 @@ export const SubtitlesTab: React.FC<{
         const caps = captionsRef.current;
         const fps = bridge.fps || 30;
         const ms = (bridge.frame / fps) * 1000;
-        let active = -1;
-        for (let i = 0; i < caps.length; i++) {
-          const nextStart = i + 1 < caps.length ? caps[i + 1].startMs : caps[i].endMs;
-          if (caps[i].startMs <= ms && ms < nextStart) {
-            active = i;
-            break;
-          }
-        }
+        const active = activeCaptionIndex(caps, ms);
         const el =
           active >= 0
             ? listRef.current.querySelector<HTMLElement>(`[data-cap="${active}"]`)
@@ -398,37 +552,183 @@ export const SubtitlesTab: React.FC<{
           }
         }
       }
+
+      // On-video caption click → open this caption in the inline editor. The
+      // request arrives via window.__veEditRequest (set by CaptionOverlay in the
+      // composition window — same bridge pattern as __veSubtitleFrame). The nonce
+      // makes a repeat click on the same caption re-trigger.
+      const editReq = (window as Window & {
+        __veEditRequest?: { index: number; nonce: number };
+      }).__veEditRequest;
+      if (editReq && editReq.nonce !== handledEditNonce) {
+        handledEditNonce = editReq.nonce;
+        const seg = captionsRef.current[editReq.index];
+        const c = listRef.current;
+        if (seg && c && !busyRef.current) {
+          // Scroll the target row to the middle of the list BEFORE it becomes the
+          // edit form (the editing row has no [data-cap]).
+          const el = c.querySelector<HTMLElement>(`[data-cap="${editReq.index}"]`);
+          if (el) {
+            const cRect = c.getBoundingClientRect();
+            const rRect = el.getBoundingClientRect();
+            c.scrollTop += rRect.top - cRect.top + rRect.height / 2 - c.clientHeight / 2;
+          }
+          followingRef.current = false; // don't let auto-follow steal the scroll
+          setEditingIndex(editReq.index);
+          setDraftText(seg.text);
+          setDraftStart(msToClock(seg.startMs));
+          setDraftEnd(msToClock(seg.endMs));
+          setDraftCaret(seg.text.length);
+        }
+      }
+
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
   }, []);
 
+  // Fill progress bar while applying OR fixing. No real signal from the sidecar
+  // (one blocking POST), so fill LINEARLY at a rate scaled to the video length —
+  // a longer video means a longer re-cut — reaching the 90% cap at ~that time.
+  // Linear (not eased) so the bar keeps moving the whole time instead of pinning
+  // near the end. Snaps to 100% on success (applySuccessRef), resets on error.
+  useEffect(() => {
+    if (!busy) {
+      if (applySuccessRef.current) {
+        applySuccessRef.current = false;
+        setProgress(100);
+        const t = setTimeout(() => setProgress(0), 500);
+        return () => clearTimeout(t);
+      }
+      setProgress(0);
+      return;
+    }
+    setProgress(1);
+    const caps = captionsRef.current;
+    const videoMs = caps.length ? caps[caps.length - 1].endMs : 0;
+    const expectedMs = Math.max(8000, videoMs); // ~realtime re-cut; 8s floor
+    const TICK = 200;
+    const step = (90 / expectedMs) * TICK; // linear: hits 90% cap at expectedMs
+    const id = setInterval(() => {
+      setProgress((p) => Math.min(p + step, 90));
+    }, TICK);
+    return () => clearInterval(id);
+  }, [busy]);
+
+  // Probe the selected project's artifacts on switch. Sidecar offline → leave
+  // health null (no banner) so a stopped sidecar never raises a false alarm.
+  useEffect(() => {
+    if (!project) {
+      setHealth(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${HEALTH_URL}?project=${encodeURIComponent(project)}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled) {
+          setHealth({ corrupt: Boolean(data.corrupt), resumeStep: data.resumeStep ?? null });
+        }
+      } catch {
+        if (!cancelled) setHealth(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [project]);
+
+  // Mirror pending deletions to the module-level store so they survive a
+  // tab-switch remount (NOT a reload — staging marks die on reload; see
+  // pendingStore at top of file). Keyed by project; clears the entry when nothing
+  // is pending. On a project switch this runs AFTER the in-render reset above, so
+  // it always writes the new project's own (reset) state — never the old's marks.
+  useEffect(() => {
+    if (!project) return;
+    if (pendingDrops.size === 0 && pendingLines.size === 0) {
+      pendingStore.delete(project);
+    } else {
+      pendingStore.set(project, {
+        drops: new Set(pendingDrops),
+        lines: new Set(pendingLines),
+      });
+    }
+  }, [pendingDrops, pendingLines, project]);
+
+  // Close the inline editor when the user clicks OUTSIDE the caption list (edits are
+  // auto-saved, so closing never loses work). A click on ANOTHER row inside the list
+  // is intentionally NOT closed here — that row's own onClick handles it (beginEdit
+  // swaps editingIndex in a single render). If we closed here on mousedown instead,
+  // the tall edit row would collapse first, shifting a row BELOW upward between
+  // mousedown and mouseup, so the click would miss it and never open it. (Rows above
+  // happened to work only because closing doesn't move them.)
+  useEffect(() => {
+    if (editingIndex === null) return;
+    const onDown = (e: MouseEvent) => {
+      if (listRef.current && !listRef.current.contains(e.target as Node)) {
+        setEditingIndex(null);
+      }
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [editingIndex]);
+
   const hasCaptions = captions.length > 0;
   const groups = groupByCut(captions);
 
-  // In-memory only (shouldSave:false). Remotion's shouldSave path runs a codemod
-  // that rewrites the matching <Composition> in Root.tsx, but our Root.tsx renders
-  // compositions in a .map() with id={p.name} (not a string literal), so the
-  // codemod finds no tag and throws "Could not find defaultProps for composition".
-  // The snapshot json is the source of truth; live edits stay in the Studio store
-  // for the session (durable default comes from the pipeline per mode).
+  // Flip the in-memory store for instant preview (shouldSave:false — Remotion's
+  // shouldSave codemod rewrites a <Composition> with a string-literal id, but our
+  // Root.tsx maps compositions with id={p.name}, so it would throw "Could not find
+  // defaultProps for composition"). Persist the new value into the snapshot json
+  // (the source of truth) via the SAME save path as caption edits — it rides along
+  // as captionsEnabled — so the toggle survives reloads AND re-cuts (the pipeline
+  // preserves the stored value across an Apply instead of resetting to the mode
+  // default). Best-effort: sidecar offline → preview-only for the session.
   const toggle = () => {
-    setDefaultProps?.(
-      (p) => ({ ...p, captionsEnabled: !p.captionsEnabled }),
-      { shouldSave: false }
-    );
+    const next = !on;
+    setDefaultProps?.((p) => ({ ...p, captionsEnabled: next }), { shouldSave: false });
+    if (!project) return;
+    fetch(SAVE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project, captions, captionsEnabled: next }),
+    }).catch(() => {});
   };
 
   const beginEdit = (absIndex: number) => {
+    if (busy) return; // no editing mid-cut — the re-cut + reload would discard it
     const seg = captions[absIndex];
     setEditingIndex(absIndex);
     setDraftText(seg.text);
     setDraftStart(msToClock(seg.startMs));
     setDraftEnd(msToClock(seg.endMs));
+    setDraftCaret(seg.text.length);
   };
 
-  const cancelEdit = () => setEditingIndex(null);
+  // Debounced persist of edited captions to the project snapshot (durable +
+  // visible to a CLI render). Best-effort: sidecar offline → preview-only.
+  const persistCaptions = (caps: CaptionSegment[]) => {
+    if (!project || busy) return; // never persist during a cut — it would race the re-cut
+    if (persistTimer.current) clearTimeout(persistTimer.current);
+    persistTimer.current = setTimeout(() => {
+      fetch(SAVE_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project, captions: caps }),
+      }).catch(() => {});
+    }, 500);
+  };
+
+  // Commit a new caption list: update the Studio store for instant preview
+  // (shouldSave:false — the .map()'d <Composition id={p.name}> defeats the
+  // shouldSave codemod) AND schedule a snapshot persist.
+  const commitCaptions = (next: CaptionSegment[]) => {
+    setDefaultProps?.((p) => ({ ...p, captions: next }), { shouldSave: false });
+    persistCaptions(next);
+  };
 
   // Click a caption's timestamp → seek the Studio player there. `seek` is a public
   // @remotion/studio export reachable from chrome; fps comes from the FrameBridge.
@@ -441,39 +741,177 @@ export const SubtitlesTab: React.FC<{
 
   const startMs = clockToMs(draftStart);
   const endMs = clockToMs(draftEnd);
-  const editValid =
-    startMs !== null && endMs !== null && startMs >= 0 && endMs > startMs;
 
-  const saveEdit = () => {
-    if (editingIndex === null || !editValid) return;
+  // Auto-save (no Save button): commit the edit live on every keystroke. Called
+  // with the NEW values explicitly because draft state updates async. A transiently
+  // invalid timestamp (unparseable, negative, or end<=start) is skipped so a
+  // half-typed clock never clobbers the caption — the last valid value stays.
+  const autoSave = (textVal: string, startVal: string, endVal: string) => {
+    if (editingIndex === null) return;
+    const s = clockToMs(startVal);
+    const e = clockToMs(endVal);
+    if (s === null || e === null || s < 0 || e <= s) return;
     const next = captions.map((c, i) =>
-      i === editingIndex ? { ...c, text: draftText, startMs: startMs!, endMs: endMs! } : c
+      i === editingIndex ? { ...c, text: textVal, startMs: s, endMs: e } : c
     );
-    // shouldSave:false — same reason as toggle (codemod can't match the .map()'d
-    // <Composition id={p.name}>). Edit lives in the Studio store for the session.
-    setDefaultProps?.((p) => ({ ...p, captions: next }), { shouldSave: false });
-    setEditingIndex(null);
+    commitCaptions(next);
   };
 
+  // Split the editing line into two at the caret (word boundary). Each half takes
+  // its own words' timestamps — frame-exact, no interpolation. Both keep the
+  // parent cutIndex (split stays inside the cut). Staged line-deletes remap: a
+  // marked line stays marked on BOTH halves; everything after shifts +1.
+  const doSplit = () => {
+    if (editingIndex === null) return;
+    const i = editingIndex;
+    const cap = captions[i];
+    const words = cap.words ?? [];
+    const tokens = draftText.split(/\s+/).filter(Boolean);
+    const k = splitAt(draftText, draftCaret);
+    if (k === null || words.length !== tokens.length || k <= 0 || k >= words.length) return;
+    const aWords = words.slice(0, k);
+    const bWords = words.slice(k);
+    const lineA: CaptionSegment = {
+      ...cap,
+      text: tokens.slice(0, k).join(" "),
+      startMs: aWords[0].startMs,
+      endMs: aWords[aWords.length - 1].endMs,
+      words: aWords,
+    };
+    const lineB: CaptionSegment = {
+      ...cap,
+      text: tokens.slice(k).join(" "),
+      startMs: bWords[0].startMs,
+      endMs: bWords[bWords.length - 1].endMs,
+      words: bWords,
+    };
+    const next = [...captions.slice(0, i), lineA, lineB, ...captions.slice(i + 1)];
+    setPendingLines((prev) => {
+      const out = new Set<number>();
+      prev.forEach((j) => {
+        if (j < i) out.add(j);
+        else if (j === i) {
+          out.add(i);
+          out.add(i + 1);
+        } else out.add(j + 1);
+      });
+      return out;
+    });
+    setEditingIndex(null);
+    commitCaptions(next);
+  };
+
+  // Merge the editing line with its neighbor above (dir -1) or below (dir +1).
+  // Allowed only within a cut (same cutIndex) — so it's auto-blocked on the
+  // first/last line of a cut. Span union, text space-joined, words concatenated.
+  // Per design, merging CLEARS any delete-mark on the two lines; later indices -1.
+  const mergeEditing = (dir: -1 | 1) => {
+    if (editingIndex === null) return;
+    const i = editingIndex;
+    const j = i + dir;
+    if (j < 0 || j >= captions.length) return;
+    const lo = Math.min(i, j);
+    const a = captions[lo];
+    const b = captions[lo + 1];
+    if ((a.cutIndex ?? null) !== (b.cutIndex ?? null)) return;
+    const merged: CaptionSegment = {
+      ...a,
+      text: `${a.text} ${b.text}`.trim(),
+      startMs: a.startMs,
+      endMs: b.endMs,
+      words: [...(a.words ?? []), ...(b.words ?? [])],
+    };
+    const next = [...captions.slice(0, lo), merged, ...captions.slice(lo + 2)];
+    setPendingLines((prev) => {
+      const out = new Set<number>();
+      prev.forEach((x) => {
+        if (x === lo || x === lo + 1) return;
+        out.add(x < lo ? x : x - 1);
+      });
+      return out;
+    });
+    setEditingIndex(null);
+    commitCaptions(next);
+  };
+
+  // Delete/undo a whole cut. Canonical form: a fully-deleted cut lives in
+  // `pendingDrops` with NONE of its lines in `pendingLines` (the cut-drop subsumes
+  // them), so toggling either way clears any per-line marks for that cut.
   const toggleDrop = (cutIndex: number) => {
     setApplyError(null);
+    const grp = groups.find((g) => g.cutIndex === cutIndex);
+    const lineIdxs = grp ? grp.rows.map((r) => r.absIndex) : [];
+    const wasDropped = pendingDrops.has(cutIndex);
     setPendingDrops((prev) => {
       const next = new Set(prev);
-      next.has(cutIndex) ? next.delete(cutIndex) : next.add(cutIndex);
+      wasDropped ? next.delete(cutIndex) : next.add(cutIndex);
+      return next;
+    });
+    setPendingLines((prev) => {
+      const next = new Set(prev);
+      lineIdxs.forEach((i) => next.delete(i));
       return next;
     });
   };
 
-  // Stage a single caption line for deletion (edit-row X). Mirrors the cut toggle;
-  // closes the editor. Committed by the same Apply as a video cut (its time span).
+  // Stage/undo a single caption line, kept canonical with the cut-level state
+  // (see toggleDrop): marking a cut's last line collapses to one cut-drop; undoing
+  // one line of a dropped cut expands it back to the remaining lines. Closes the editor.
   const toggleLine = (absIndex: number) => {
     setApplyError(null);
+    setEditingIndex(null);
+    const grp = groups.find((g) => g.rows.some((r) => r.absIndex === absIndex));
+    const cutIndex = grp?.cutIndex ?? null;
+    const lineIdxs = grp ? grp.rows.map((r) => r.absIndex) : [absIndex];
+
+    // Part of a whole-cut drop → undo expands it back to the other lines.
+    if (cutIndex !== null && pendingDrops.has(cutIndex)) {
+      setPendingDrops((prev) => {
+        const next = new Set(prev);
+        next.delete(cutIndex);
+        return next;
+      });
+      setPendingLines((prev) => {
+        const next = new Set(prev);
+        lineIdxs.forEach((i) => {
+          if (i !== absIndex) next.add(i);
+        });
+        return next;
+      });
+      return;
+    }
+
+    // Already marked per-line → un-mark it.
+    if (pendingLines.has(absIndex)) {
+      setPendingLines((prev) => {
+        const next = new Set(prev);
+        next.delete(absIndex);
+        return next;
+      });
+      return;
+    }
+
+    // Marking this line completes the cut → collapse to a single cut-drop.
+    if (cutIndex !== null && lineIdxs.every((i) => i === absIndex || pendingLines.has(i))) {
+      setPendingDrops((prev) => {
+        const next = new Set(prev);
+        next.add(cutIndex);
+        return next;
+      });
+      setPendingLines((prev) => {
+        const next = new Set(prev);
+        lineIdxs.forEach((i) => next.delete(i));
+        return next;
+      });
+      return;
+    }
+
+    // Plain per-line mark.
     setPendingLines((prev) => {
       const next = new Set(prev);
-      next.has(absIndex) ? next.delete(absIndex) : next.add(absIndex);
+      next.add(absIndex);
       return next;
     });
-    setEditingIndex(null);
   };
 
   // Apply staged deletions: POST to the sidecar, which re-cuts the video via
@@ -481,27 +919,72 @@ export const SubtitlesTab: React.FC<{
   // Studio then hot-reloads the shorter composition.
   const applyDrops = async () => {
     if (pendingCount === 0 || applying || !project) return;
+    // Cancel a queued auto-save: it holds pre-cut captions and would otherwise
+    // land AFTER the re-cut and clobber the re-mapped snapshot.
+    if (persistTimer.current) clearTimeout(persistTimer.current);
+    setEditingIndex(null); // close any open editor — edits are locked during the cut
     setApplying(true);
     setApplyError(null);
+
+    // A line-drop carves the caption's [startMs, endMs] out of the video. But word
+    // timings (especially after a split/merge) can make a caption's end run PAST the
+    // next caption's start, so the raw range would bleed into — and delete — an
+    // adjacent line we're keeping. Clamp each range to the nearest SURVIVING caption
+    // on each side. Adjacent dropped lines are NOT clamped against each other (their
+    // ranges simply merge in the re-cut). The clamped range still lies inside the
+    // dropped caption, so the caption itself is still removed.
+    const isDropped = (idx: number) =>
+      pendingLines.has(idx) ||
+      (typeof captions[idx].cutIndex === "number" &&
+        pendingDrops.has(captions[idx].cutIndex as number));
+    const dropRangeFor = (i: number) => {
+      let startMs = captions[i].startMs;
+      let endMs = captions[i].endMs;
+      for (let p = i - 1; p >= 0; p--) {
+        if (!isDropped(p)) { startMs = Math.max(startMs, captions[p].endMs); break; }
+      }
+      for (let n = i + 1; n < captions.length; n++) {
+        if (!isDropped(n)) { endMs = Math.min(endMs, captions[n].startMs); break; }
+      }
+      return { startMs, endMs };
+    };
+
     try {
       const res = await fetch(SIDECAR_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           project,
+          // Authoritative current captions → sidecar persists them, then
+          // 4_render re-maps THEM through the cut (manual edits survive).
+          captions,
           dropCutIndices: [...pendingDrops],
-          dropRanges: [...pendingLines].map((i) => ({
-            startMs: captions[i].startMs,
-            endMs: captions[i].endMs,
-          })),
+          dropRanges: [...pendingLines].map(dropRangeFor),
         }),
       });
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
         throw new Error(data.log || data.error || `sidecar error ${res.status}`);
       }
-      setPendingDrops(new Set()); // HMR refreshes the composition from the new snapshot
+      applySuccessRef.current = true;
+      // Clear the staged marks in STATE and the session store. We reload below, but
+      // the snapshot rewrite also triggers Studio HMR, which can re-render this tab
+      // against the new (shorter) captions BEFORE the reload resets React state. A mark
+      // left in state then re-attaches by index to whatever caption now occupies that
+      // slot — e.g. dropping a cut's first line leaves index 0 marked, which after the
+      // cut is the NEXT line. Emptying both here guarantees no stale mark survives even
+      // if the reload is delayed or a no-op.
+      setPendingDrops(new Set());
       setPendingLines(new Set());
+      pendingStore.delete(project);
+      // Hard reload on success. The re-cut swaps edited.mp4 in place; @remotion/media's
+      // audio decoder can throw "EncodingError: Decoding error" on the hot-swapped file
+      // until a fresh load (a manual reload clears it). Reloading also resets the Studio
+      // store to the re-mapped snapshot the pipeline just wrote — so it doubles as the
+      // post-cut resync, and no stale caption override can survive to desync the track.
+      void data; // (captions come back via the reloaded snapshot, not the response)
+      window.location.reload();
+      return;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setApplyError(
@@ -511,6 +994,38 @@ export const SubtitlesTab: React.FC<{
       );
     } finally {
       setApplying(false);
+    }
+  };
+
+  // Repair a corrupt project: POST to the sidecar, which regenerates edited.mp4 +
+  // the snapshot from the last valid pipeline step (no Studio re-open, no final
+  // render). Reuses the Apply progress bar (busy); clears the banner on success —
+  // HMR reloads the repaired composition.
+  const fixProject = async () => {
+    if (!project || fixing) return;
+    setFixing(true);
+    setApplyError(null);
+    try {
+      const res = await fetch(FIX_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.log || data.error || `sidecar error ${res.status}`);
+      }
+      applySuccessRef.current = true; // snap the progress bar to 100%
+      setHealth({ corrupt: false, resumeStep: null });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setApplyError(
+        msg.includes("Failed to fetch")
+          ? "Sidecar not running — start it: cd src/pipeline && python3 sidecar.py"
+          : msg
+      );
+    } finally {
+      setFixing(false);
     }
   };
 
@@ -558,15 +1073,57 @@ export const SubtitlesTab: React.FC<{
           {applyError}
         </div>
       )}
+      {health?.corrupt && (
+        <div
+          style={{
+            flexShrink: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 10,
+            padding: "8px 12px",
+            fontSize: 12,
+            color: "#f4d35e",
+            background: "rgba(192,57,43,0.18)",
+            borderBottom: "1px solid rgba(192,57,43,0.35)",
+          }}
+        >
+          <span>
+            ⚠ This project&apos;s video is corrupt or incomplete
+            {health.resumeStep
+              ? ` — Fix re-runs the pipeline from step ${health.resumeStep}.`
+              : "."}
+          </span>
+          <button
+            style={applyBtn(true, fixing)}
+            onClick={fixProject}
+            disabled={fixing}
+            title="Regenerate edited.mp4 + snapshot from the last valid step"
+          >
+            {fixing ? "Fixing…" : "Fix"}
+          </button>
+        </div>
+      )}
+      {progress > 0 && (
+        <div style={{ height: 3, background: "#1e242a", flexShrink: 0, overflow: "hidden" }}>
+          <div style={{ height: "100%", width: `${progress}%`, background: "#0b84f3", transition: "width 0.2s ease" }} />
+        </div>
+      )}
 
       {hasCaptions ? (
-        <div style={list} className="ve-cap-list" ref={listRef} onWheel={disarm} onTouchMove={disarm}>
+        <div
+          style={busy ? { ...list, opacity: 0.5, pointerEvents: "none" } : list}
+          className="ve-cap-list"
+          ref={listRef}
+          onWheel={disarm}
+          onTouchMove={disarm}
+        >
           {groups.map((group, gi) => {
             const cutMarked = group.cutIndex !== null && pendingDrops.has(group.cutIndex);
             return (
             <div key={group.cutIndex ?? `g${gi}`}>
               {group.cutIndex !== null && (
-                <div style={cutHeader}>
+                <div style={cutHeader} onClick={() => setEditingIndex(null)}>
                   <span>Cut {group.cutIndex + 1}</span>
                   <span
                     onClick={() => toggleDrop(group.cutIndex as number)}
@@ -582,73 +1139,122 @@ export const SubtitlesTab: React.FC<{
                   </span>
                 </div>
               )}
-              {group.rows.map(({ caption, absIndex }) =>
-                editingIndex === absIndex ? (
-                  <div style={editWrap} key={absIndex}>
-                    <div>
-                      <label style={fieldLabel}>Text</label>
-                      <textarea
+              {group.rows.map(({ caption, absIndex }) => {
+                if (editingIndex === absIndex) {
+                  const wlen = caption.words?.length ?? 0;
+                  const tokenCount = draftText.split(/\s+/).filter(Boolean).length;
+                  // Split needs a caret on a word boundary AND text whose word count
+                  // still matches the per-word timing array (so each half gets exact ms).
+                  const canSplit =
+                    splitAt(draftText, draftCaret) !== null && wlen >= 2 && tokenCount === wlen;
+                  const sameCut = (s?: CaptionSegment) =>
+                    !!s && (s.cutIndex ?? null) === (caption.cutIndex ?? null);
+                  const canMergeUp = sameCut(captions[absIndex - 1]);
+                  const canMergeDown = sameCut(captions[absIndex + 1]);
+                  return (
+                  <div style={editRow} key={absIndex}>
+                    {/* Row 1: left label (the timestamp slot) · text input · delete ✕.
+                        The input sets no font-size, so Remotion's .css-reset rule sizes
+                        it to 16px — identical to the inactive display caption text. */}
+                    <div style={{ ...editLine, alignItems: "baseline" }}>
+                      <span style={editLeftLabel}>Text</span>
+                      <input
+                        type="text"
                         value={draftText}
-                        onChange={(e) => setDraftText(e.target.value)}
-                        rows={2}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setDraftText(v);
+                          setDraftCaret(e.target.selectionStart ?? 0);
+                          autoSave(v, draftStart, draftEnd);
+                        }}
+                        onSelect={(e) => setDraftCaret(e.currentTarget.selectionStart ?? 0)}
+                        onKeyUp={(e) => setDraftCaret(e.currentTarget.selectionStart ?? 0)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape") {
+                            e.preventDefault();
+                            setEditingIndex(null);
+                          }
+                        }}
                         autoFocus
-                        style={{ ...input, resize: "none", lineHeight: 1.4 }}
+                        style={editTextInput}
                       />
+                      <span
+                        style={{
+                          ...delBtn,
+                          color: cutMarked || pendingLines.has(absIndex) ? "#e0b341" : "#c0392b",
+                        }}
+                        onClick={() => toggleLine(absIndex)}
+                        title={
+                          cutMarked || pendingLines.has(absIndex) ? "Undo delete" : "Delete this line"
+                        }
+                      >
+                        {cutMarked || pendingLines.has(absIndex) ? "Undo" : "✕"}
+                      </span>
                     </div>
-                    {/* Start/End + buttons share one row; wrap to stack when the
-                        sidebar is too narrow for all four. */}
-                    <div
-                      style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}
-                    >
-                      <div>
-                        <label style={fieldLabel}>Start</label>
-                        <input
-                          type="text"
-                          value={draftStart}
-                          onChange={(e) => setDraftStart(e.target.value)}
-                          placeholder="0:00.000"
-                          title="m:ss.mmm"
-                          style={{ ...msInput, borderColor: startMs === null ? "#c0392b" : "#444" }}
-                        />
-                      </div>
-                      <div>
-                        <label style={fieldLabel}>End</label>
-                        <input
-                          type="text"
-                          value={draftEnd}
-                          onChange={(e) => setDraftEnd(e.target.value)}
-                          placeholder="0:00.000"
-                          title="m:ss.mmm"
-                          style={{ ...msInput, borderColor: endMs === null ? "#c0392b" : "#444" }}
-                        />
-                      </div>
-                      <div style={{ display: "flex", gap: 8, marginLeft: "auto", alignItems: "flex-end" }}>
+                    {/* Row 2: Start · End clocks (Start aligned under the text) +
+                        split/merge. Wraps when the sidebar is too narrow. */}
+                    <div style={{ ...editLine, flexWrap: "wrap", rowGap: 6 }}>
+                      <span style={editLeftLabel}>Start</span>
+                      <input
+                        type="text"
+                        value={draftStart}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setDraftStart(v);
+                          autoSave(draftText, v, draftEnd);
+                        }}
+                        placeholder="0:00.000"
+                        title="m:ss.mmm"
+                        style={{ ...editClock, borderColor: startMs === null ? "#c0392b" : "#444" }}
+                      />
+                      <span style={inlineLabel}>End</span>
+                      <input
+                        type="text"
+                        value={draftEnd}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setDraftEnd(v);
+                          autoSave(draftText, draftStart, v);
+                        }}
+                        placeholder="0:00.000"
+                        title="m:ss.mmm"
+                        style={{ ...editClock, borderColor: endMs === null ? "#c0392b" : "#444" }}
+                      />
+                      <div style={{ display: "flex", gap: 8, marginLeft: "auto", alignItems: "center" }}>
                         <button
-                          style={{ ...btn("cancel"), borderColor: "#c0392b", color: "#e88", fontWeight: 800 }}
-                          onClick={() => toggleLine(absIndex)}
-                          title="Delete this line — cuts it from the video on Apply"
+                          style={toolBtn(canSplit)}
+                          onClick={doSplit}
+                          disabled={!canSplit}
+                          title={
+                            canSplit
+                              ? "Split into two lines at the cursor"
+                              : "Put the cursor between two words to split"
+                          }
                         >
-                          ✕
-                        </button>
-                        <button style={btn("cancel")} onClick={cancelEdit}>
-                          Cancel
+                          ][
                         </button>
                         <button
-                          style={{
-                            ...btn("save"),
-                            opacity: editValid ? 1 : 0.5,
-                            cursor: editValid ? "pointer" : "default",
-                          }}
-                          onClick={saveEdit}
-                          disabled={!editValid}
-                          title={editValid ? "Save" : "End must be after Start"}
+                          style={toolBtn(canMergeUp)}
+                          onClick={() => mergeEditing(-1)}
+                          disabled={!canMergeUp}
+                          title={canMergeUp ? "Merge with the line above" : "First line of the cut"}
                         >
-                          Save
+                          ⬆
+                        </button>
+                        <button
+                          style={toolBtn(canMergeDown)}
+                          onClick={() => mergeEditing(1)}
+                          disabled={!canMergeDown}
+                          title={canMergeDown ? "Merge with the line below" : "Last line of the cut"}
+                        >
+                          ⬇
                         </button>
                       </div>
                     </div>
                   </div>
-                ) : (
+                  );
+                }
+                return (
                   <div
                     style={
                       cutMarked || pendingLines.has(absIndex)
@@ -676,9 +1282,24 @@ export const SubtitlesTab: React.FC<{
                     >
                       {caption.text}
                     </span>
+                    <span
+                      onClick={() => toggleLine(absIndex)}
+                      title={
+                        cutMarked || pendingLines.has(absIndex) ? "Undo delete" : "Delete this line"
+                      }
+                      style={{
+                        flexShrink: 0,
+                        cursor: "pointer",
+                        userSelect: "none",
+                        fontWeight: 700,
+                        color: cutMarked || pendingLines.has(absIndex) ? "#e0b341" : "#c0392b",
+                      }}
+                    >
+                      {cutMarked || pendingLines.has(absIndex) ? "Undo" : "✕"}
+                    </span>
                   </div>
-                )
-              )}
+                );
+              })}
             </div>
             );
           })}

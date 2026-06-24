@@ -6,21 +6,15 @@
 .env.*
 
 # input/output/resources videos (large, user-specific)
-input/*
-output/*
-resources/*
+input/
+output/
+resources/
 
 # Pipeline and Remotion generated files
-src/data/*
-src/remotion/public/projects/
-src/remotion/public/images/
-src/remotion/public/*.mp4
+src/data/
+src/remotion/public/
 src/remotion/src/projects/
-src/remotion/src/Root.tsx
-src/remotion/src/subtitles.json
-src/remotion/src/titleCards.json
 src/remotion/node_modules/
-src/remotion/out/
 
 # Active-project state (machine-local)
 .ve_active_project

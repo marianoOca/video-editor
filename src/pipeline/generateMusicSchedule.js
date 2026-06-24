@@ -3,8 +3,8 @@ const path = require('path');
 
 // Paths
 const repoRoot = path.resolve(__dirname, '../..');
-const configPath = path.join(repoRoot, 'src/remotion/src/caro/config.ts');
-const manifestPath = path.join(repoRoot, 'src/remotion/src/caro/manifest.ts');
+const configPath = path.join(repoRoot, 'src/remotion/src/projects/caro/config.ts');
+const manifestPath = path.join(repoRoot, 'src/remotion/src/projects/caro/manifest.ts');
 
 // Read config for FPS and PHOTO_DURATION_SEC
 const configContent = fs.readFileSync(configPath, 'utf8');

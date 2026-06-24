@@ -42,6 +42,12 @@ const computeStanzaLayout = (
   return out;
 };
 
+// NOTE: keep the timing args here in sync with the <TextScene> props below. This
+// function precomputes the scene's durationInFrames (set on the Composition); the
+// component lays out the same stanzas at render. If a caller passes a custom
+// stanzaExitFrames / interStanzaGapFrames to one but not the other, the precomputed
+// duration won't match the layout → the last stanza gets clipped or padded. Pass
+// the SAME values to both.
 export const stanzaSceneDurationFrames = (
   stanzas: Stanza[],
   mode: StanzaMode = "accumulate",
@@ -50,14 +56,17 @@ export const stanzaSceneDurationFrames = (
   stanzaHoldFrames?: number,
   sceneOutroFadeFrames?: number,
   fadeToBlackFrames?: number,
+  stanzaExitFrames?: number,
+  interStanzaGapFrames?: number,
   fps: number = 30,
 ): number => {
   // Default values if not provided (sensible defaults)
   const actualLineFadeFrames = lineFadeFrames ?? 18;
   const actualLineDelayFrames = lineDelayFrames ?? 44;
   const actualStanzaHoldFrames = stanzaHoldFrames ?? Math.round(3.5 * fps);
-  const actualStanzaExitFrames = mode === "replace" ? 24 : 0; // Only used in replace mode
-  const actualInterStanzaGapFrames = mode === "accumulate" ? 35 : 0;
+  // Honor caller overrides; fall back to the mode defaults (replace exits, accumulate gaps).
+  const actualStanzaExitFrames = stanzaExitFrames ?? (mode === "replace" ? 24 : 0);
+  const actualInterStanzaGapFrames = interStanzaGapFrames ?? (mode === "accumulate" ? 35 : 0);
 
   const layout = computeStanzaLayout(
     stanzas,
@@ -82,6 +91,7 @@ type TextSceneProps = {
   lineDelayFrames?: number;
   stanzaHoldSec?: number;
   stanzaExitFrames?: number;
+  interStanzaGapFrames?: number;
   sceneOutroFadeFrames?: number;
   fadeToBlackFrames?: number;
   fadeInFromBlack?: boolean;
@@ -98,6 +108,7 @@ export const TextScene: React.FC<TextSceneProps> = ({
   lineDelayFrames,
   stanzaHoldSec = 3.5,
   stanzaExitFrames,
+  interStanzaGapFrames,
   sceneOutroFadeFrames = 12,
   fadeToBlackFrames = 24,
   fadeInFromBlack = true,
@@ -111,14 +122,15 @@ export const TextScene: React.FC<TextSceneProps> = ({
 
   const stanzaHoldFrames = Math.round(stanzaHoldSec * fps);
 
+  // Mirror stanzaSceneDurationFrames' defaults exactly — see the sync note there.
   const layout = computeStanzaLayout(
     stanzas,
     mode,
     lineFadeFrames ?? 18,
     lineDelayFrames ?? 44,
     stanzaHoldFrames,
-    stanzaExitFrames ?? 24,
-    mode === "accumulate" ? 35 : 0,
+    stanzaExitFrames ?? (mode === "replace" ? 24 : 0),
+    interStanzaGapFrames ?? (mode === "accumulate" ? 35 : 0),
   );
 
   // Text outro fade (slightly ahead of the black bridge so text exits before full black)

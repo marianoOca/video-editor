@@ -9,8 +9,8 @@ import re
 from pathlib import Path
 from srt_utils import srt_to_ms
 
-CAPTIONS_SRT  = Path(__file__).parent.parent / "src/remotion/public/captions.srt"
-CAPTIONS_JSON = Path(__file__).parent.parent / "src/remotion/public/captions.json"
+CAPTIONS_SRT  = Path(__file__).parent.parent / "remotion/public/captions.srt"
+CAPTIONS_JSON = Path(__file__).parent.parent / "remotion/public/captions.json"
 
 
 def main():

@@ -1,0 +1,50 @@
+diff --git a/node_modules/@remotion/studio-server/dist/preview-server/routes/apply-codemod.js b/node_modules/@remotion/studio-server/dist/preview-server/routes/apply-codemod.js
+index ec82965..61342b6 100644
+--- a/node_modules/@remotion/studio-server/dist/preview-server/routes/apply-codemod.js
++++ b/node_modules/@remotion/studio-server/dist/preview-server/routes/apply-codemod.js
+@@ -64,6 +64,45 @@ const getCodemodUndoDescription = (codemod) => {
+ const applyCodemodHandler = async ({ input: { codemod, dryRun, symbolicatedStack }, logLevel, remotionRoot, entryPoint, }) => {
+     var _a;
+     try {
++        // --- video-editor patch: native "Delete composition" → wipe project files ---
++        // Remotion's recast codemod can't delete a composition rendered via .map()
++        // (id={p.name} is not a string literal), and even when it works it only edits
++        // source, orphaning the project's files. Bypass it: delegate to the local
++        // sidecar (port 9848), which runs the Python delete_project (data + snapshot +
++        // public + state). Root.tsx discovers projects via require.context, so the
++        // composition drops from the sidebar on the next recompile.
++        if (codemod.type === 'delete-composition') {
++            const SIDECAR = 'http://127.0.0.1:9848';
++            if (dryRun) {
++                // Preview: enable the Delete button only if the sidecar is reachable.
++                try {
++                    const h = await fetch(`${SIDECAR}/health`);
++                    if (!h.ok) {
++                        throw new Error('bad health');
++                    }
++                }
++                catch (e) {
++                    return {
++                        success: false,
++                        reason: 'Delete needs the sidecar (port 9848). Start Studio with `npm run dev`.',
++                    };
++                }
++                return { success: true, diff: { additions: 0, deletions: 1 } };
++            }
++            // Real run: throw on failure so callApi rejects and the UI surfaces it
++            // (CodemodFooter.trigger reports success unless the promise rejects).
++            const res = await fetch(`${SIDECAR}/delete-project`, {
++                method: 'POST',
++                headers: { 'content-type': 'application/json' },
++                body: JSON.stringify({ project: codemod.idToDelete }),
++            });
++            if (!res.ok) {
++                const data = await res.json().catch(() => ({}));
++                throw new Error((data && data.error) || `sidecar returned ${res.status}`);
++            }
++            return { success: true, diff: { additions: 0, deletions: 1 } };
++        }
++        // --- end video-editor patch ---
+         const time = Date.now();
+         const filePath = symbolicatedStack
+             ? (0, apply_codemod_to_file_1.resolveFilePathFromSymbolicatedStack)(remotionRoot, symbolicatedStack)

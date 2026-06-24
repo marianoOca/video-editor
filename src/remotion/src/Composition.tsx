@@ -44,12 +44,21 @@ const FrameBridge: React.FC = () => {
   return null;
 };
 
+// Sidecar endpoint that regenerates a corrupt project from its last valid
+// pipeline step (same server the Subtitles tab uses). CORS-open, localhost only.
+const FIX_URL = "http://127.0.0.1:9848/fix";
+
 // ── Error boundary ────────────────────────────────────────────────────────────
+// Catches canvas <Video> decode failures (async, via getDerivedStateFromError).
+// When the file is corrupt it offers a Fix button that POSTs to the sidecar to
+// regenerate the project in place — Studio HMR then remounts this boundary fresh.
+// NOTE: the timeline audio-waveform "Decoding error" lives in a Studio worker and
+// never reaches here; the Subtitles-tab banner (ffprobe health check) covers that.
 class VideoErrorBoundary extends Component<
-  { src: string; children: React.ReactNode },
-  { error: string | null }
+  { src: string; project?: string; children: React.ReactNode },
+  { error: string | null; fixing: boolean; fixMsg: string | null }
 > {
-  state = { error: null };
+  state = { error: null, fixing: false, fixMsg: null };
 
   static getDerivedStateFromError(err: Error) {
     const msg = err.message ?? String(err);
@@ -63,6 +72,32 @@ class VideoErrorBoundary extends Component<
     return { error: msg };
   }
 
+  fix = async () => {
+    if (!this.props.project || this.state.fixing) return;
+    this.setState({ fixing: true, fixMsg: null });
+    try {
+      const res = await fetch(FIX_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project: this.props.project }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.log || data.error || `sidecar error ${res.status}`);
+      }
+      // Snapshot rewritten — HMR reloads the composition and remounts this fresh.
+      this.setState({ fixMsg: "Fixed — reloading…" });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.setState({
+        fixing: false,
+        fixMsg: msg.includes("Failed to fetch")
+          ? "Sidecar not running — start it: cd src/pipeline && python3 sidecar.py"
+          : msg,
+      });
+    }
+  };
+
   render() {
     if (this.state.error) {
       return (
@@ -72,6 +107,8 @@ class VideoErrorBoundary extends Component<
             alignItems: "center",
             flexDirection: "column",
             gap: 12,
+            padding: 24,
+            textAlign: "center",
             background: "#111",
           }}
         >
@@ -95,6 +132,32 @@ class VideoErrorBoundary extends Component<
           >
             {this.props.src}
           </div>
+          {this.props.project && (
+            <button
+              onClick={this.fix}
+              disabled={this.state.fixing}
+              style={{
+                marginTop: 8,
+                border: "none",
+                borderRadius: 8,
+                padding: "10px 28px",
+                fontSize: 15,
+                fontWeight: 800,
+                fontFamily: "system-ui, sans-serif",
+                color: "#fff",
+                background: "#0b84f3",
+                cursor: this.state.fixing ? "default" : "pointer",
+                opacity: this.state.fixing ? 0.6 : 1,
+              }}
+            >
+              {this.state.fixing ? "Fixing…" : "Fix"}
+            </button>
+          )}
+          {this.state.fixMsg && (
+            <div style={{ color: "#A6A7A9", fontSize: 12, fontFamily: "monospace", maxWidth: 520 }}>
+              {this.state.fixMsg}
+            </div>
+          )}
         </AbsoluteFill>
       );
     }
@@ -106,6 +169,7 @@ class VideoErrorBoundary extends Component<
 export const VideoComposition: React.FC<CompositionProps> = ({
   videoSrc,
   videoVersion,
+  project,
   imageOverlays,
   captions,
   titleCards,
@@ -115,14 +179,15 @@ export const VideoComposition: React.FC<CompositionProps> = ({
   const videoUrl = `${staticFile(videoSrc)}?v=${videoVersion ?? 0}`;
   return (
     <AbsoluteFill style={{ background: "black" }}>
-      <VideoErrorBoundary src={videoSrc}>
+      <VideoErrorBoundary src={videoSrc} project={project}>
         <Video
           src={videoUrl}
           objectFit="cover"
           style={{ width: "100%", height: "100%" }}
-          stack={TIMELINE_DRAG_LOCK} />
+          stack={TIMELINE_DRAG_LOCK}
+          delayRenderTimeoutInMilliseconds={300_000} />
       </VideoErrorBoundary>
-      <ImageOverlayLayer overlays={imageOverlays ?? []} />
+      <ImageOverlayLayer overlays={imageOverlays ?? []} project={project} />
       {captionsEnabled ? <CaptionOverlay captions={captions ?? []} /> : null}
       <TitleCardLayer titleCards={titleCards ?? []} />
       {getRemotionEnvironment().isStudio ? <FrameBridge /> : null}

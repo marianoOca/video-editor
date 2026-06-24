@@ -31,6 +31,7 @@ import sys
 import argparse
 import shutil
 from pathlib import Path
+from typing import Optional
 
 PIPELINE = Path(__file__).parent
 REPO_INPUT = Path(__file__).resolve().parents[2] / "input"
@@ -56,7 +57,8 @@ def derive_project_name(args, input_dir: Path):
     return None
 
 
-def run_step(script: str, extra_args: list[str] = []):
+def run_step(script: str, extra_args: Optional[list[str]] = None):
+    extra_args = extra_args or []
     print(f"\n{'='*50}")
     print(f"▶  {script}")
     print(f"{'='*50}")
@@ -96,6 +98,10 @@ def main():
                         help="Also detect and cut retakes via Claude (passed to step 3)")
     parser.add_argument("--output-name", default=None,
                         help="Output filename stem for --render (e.g. prueba1 → output/prueba1.mp4)")
+    parser.add_argument("--no-open", action="store_true",
+                        help="Don't open Studio at the end (regenerate in place; used by the Fix sidecar)")
+    parser.add_argument("--until", dest="until_step", type=int, default=6,
+                        help="Stop after step N (1-6); pairs with --from to run a bounded range")
     args = parser.parse_args()
 
     # Resolve the active project BEFORE importing config (config builds its path
@@ -121,6 +127,9 @@ def main():
         render_extra.append("--no-subtitles")
     if args.no_title:
         render_extra.append("--no-title")
+    # --no-open only matters in the non-render path (--render never opens Studio).
+    if args.no_open and not args.render:
+        render_extra.append("--no-open")
 
     normalize_extra = ["--mode", args.mode] if args.mode else []
     if args.input:
@@ -142,7 +151,7 @@ def main():
     # (no images, no title cards, no lower-thirds), so skip steps 5–6 there.
     # Mode is known only after step 1 writes data/mode.json.
     for num, script, extra in steps:
-        if num < args.from_step:
+        if num < args.from_step or num > args.until_step:
             continue
         if num >= 5:
             mode = get_mode()["mode"]

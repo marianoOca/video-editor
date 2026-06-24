@@ -34,15 +34,15 @@ Usage:
 """
 
 import json
-import re
-import subprocess
 import argparse
 import sys
 from pathlib import Path
-from config import OUT_DIR, get_duration, call_claude
+from config import OUT_DIR, get_duration, call_claude, silencedetect
 
-MAX_KEEP_GAP = 0.4    # seconds — no-talk spans longer than this are cut, consider final removed gaps will be > MAX_KEEP_GAP + 2 * KEEP_PAD
-KEEP_PAD = 0.15       # seconds — headroom when no silence boundary to snap to
+# for YouTube MAX_KEEP_GAP = 0.3 & KEEP_PAD = 0.3,  and we use microphone, better error tolerance for youtube videos with no mic or longer silences and more tone variance
+# for reels MAX_KEEP_GAP = 0.2 & KEEP_PAD = 1, this should make the videos quicker, sanppier, but more prone to errors but handable if video short
+MAX_KEEP_GAP = 0.3    # seconds — no-talk spans longer than this are cut, consider final removed gaps will be > MAX_KEEP_GAP + 2 * KEEP_PAD
+KEEP_PAD = 0.3       # seconds — headroom when no silence boundary to snap to
 MIN_SEGMENT = 0.2     # seconds — keep fragments shorter than this are dropped
 NONSPEECH_PAD = 0.05  # seconds — outward pad on whisper-labeled non-speech cuts
 
@@ -71,19 +71,14 @@ def flatten_words(transcript: dict) -> list[dict]:
     return words
 
 
-def detect_silences(video: Path) -> list[dict]:
-    """Run ffmpeg silencedetect; return silence intervals [{start, end}].
-    Used only to snap keep-block edges to real speech boundaries."""
-    result = subprocess.run(
-        ["ffmpeg", "-i", str(video),
-         "-af", f"silencedetect=noise={SILENCE_DB}dB:d={SILENCE_MIN}",
-         "-f", "null", "-"],
-        capture_output=True, text=True,
-    )
-    out = result.stderr
-    starts = [float(m) for m in re.findall(r"silence_start: ([\d.]+)", out)]
-    ends = [float(m) for m in re.findall(r"silence_end: ([\d.]+)", out)]
-    return [{"start": s, "end": e} for s, e in zip(starts, ends)]
+def detect_silences(video: Path, total_duration: float) -> list[dict]:
+    """Silence intervals [{start, end}] via the shared config.silencedetect helper.
+    Used only to snap keep-block edges to real speech boundaries. Passing
+    total_duration closes a trailing pause that ends at EOF (which silencedetect
+    would otherwise leave unpaired)."""
+    return [{"start": s, "end": e}
+            for s, e in silencedetect(video, SILENCE_DB, SILENCE_MIN,
+                                      total_duration=total_duration)]
 
 
 def drop_silent_words(words: list[dict],
@@ -259,7 +254,7 @@ def find_repetitions(words: list[dict]) -> list[dict]:
 
     if total_span <= REPETITION_CHUNK_SEC:
         prompt = _build_repetition_prompt(_format_words_for_prompt(words))
-        data = call_claude(prompt, timeout=120)
+        data = call_claude(prompt)
         return data.get("repetitions", []) if data else []
 
     # Chunked path for long transcripts: overlap chunks so a repetition that
@@ -272,7 +267,7 @@ def find_repetitions(words: list[dict]) -> list[dict]:
         chunk_words = [w for w in words if chunk_start <= w["start"] < chunk_end]
         if chunk_words:
             prompt = _build_repetition_prompt(_format_words_for_prompt(chunk_words))
-            data = call_claude(prompt, timeout=120)
+            data = call_claude(prompt)
             all_reps.extend(data.get("repetitions", []) if data else [])
         chunk_start = chunk_end - REPETITION_CHUNK_OVERLAP
 
@@ -350,7 +345,7 @@ def main():
     words = flatten_words(transcript)
     print(f"  Transcript words: {len(words)}")
 
-    silences = detect_silences(combined)
+    silences = detect_silences(combined, total_duration)
 
     words, dropped_silent = drop_silent_words(words, silences)
     if dropped_silent:

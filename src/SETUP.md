@@ -18,7 +18,6 @@ All editing runs **locally** on the user's machine. Nothing is uploaded to the c
 The stack is:
 - **Remotion** — "video as code" framework in React. It's the render engine.
 - **Claude Code** — agent that writes/modifies Remotion code based on natural-language requests.
-- **Graphify** — skill that indexes the codebase into a graph and saves Claude tokens between sessions.
 - **Whisper / ffmpeg** — for transcription, translation, and silence analysis.
 
 In the future this project will be packaged as a distributable skill (probably via a GitHub repo) so non-technical users can install it in their own Claude.
@@ -47,38 +46,7 @@ If any are missing:
 If Homebrew is not installed: `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
 
 **Important for macOS:** the system `pip3` is locked by PEP 668. If `pip install` fails with `externally-managed-environment`, use one of these options:
-- Recommended: `pipx install graphify` (install pipx first with `brew install pipx`).
 - Quick alternative: add `--break-system-packages` to the end of the pip command.
-
----
-
-## 3. Install Graphify
-
-This is the skill that gives Claude a graph of the codebase to save tokens.
-
-```bash
-# Install the package (see note above about --break-system-packages)
-pip3 install graphifyy --break-system-packages
-
-# Verify
-graphify --version   # should show 0.7.x or higher
-
-# If "graphify: command not found", add to PATH:
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-Then install the Claude Code integration:
-
-```bash
-graphify install --platform claude
-```
-
-This does two things:
-1. Copies `SKILL.md` to `~/.claude/skills/graphify/SKILL.md`.
-2. Creates or updates `~/.claude/CLAUDE.md` with a rule that triggers `/graphify` when needed.
-
-**Verification:** run `cat ~/.claude/CLAUDE.md` and confirm it contains a `# graphify` section.
 
 ---
 
@@ -130,44 +98,15 @@ or check that `.claude/skills/remotion-best-practices` resolves correctly (not a
 
 ---
 
-## 6. Index the project with Graphify
+## 6. Custom Studio chrome (patch-package) + dev workflow
 
-Inside Claude Code, with the project open:
+> Steps 4–5 scaffold a *vanilla* Remotion project. This repo also ships custom Studio features that a fresh `create-video` does NOT include. When **cloning this repo** (vs bootstrapping from scratch), the setup is just `cd src/remotion && npm install` — `postinstall` applies them automatically.
 
-```
-/graphify .
-```
+Two `patch-package` patches live in `src/remotion/patches/` and apply on every `npm install`:
+- `@remotion+studio+<ver>.patch` — adds the **Subtitles tab** to Studio's sidebar and rewords the **Delete project** dialog (frontend bundle).
+- `@remotion+studio-server+<ver>.patch` — makes Studio's native **Delete** wipe the whole project, not just edit source.
 
-This scans the entire project and generates the `graphify-out/` folder with:
-- `graph.json` — the persistent graph
-- `graph.html` — interactive visualizer
-- `GRAPH_REPORT.md` — human-readable report
-- `cache/` — cache for incremental updates
-
-The first run takes a moment. Subsequent runs are incremental and fast.
-
-**Add `graphify-out/` to `.gitignore`** (it's local only, no need to version it):
-
-```bash
-cd "/Users/mar/Documents/Claude/Projects/FA Automations/video-editor"
-echo "graphify-out/" >> .gitignore
-```
-
----
-
-## 7. Confirm the navigation rule in CLAUDE.md
-
-Open `~/.claude/CLAUDE.md` and make sure this block exists (add it if missing):
-
-```markdown
-## Context navigation
-When you need to understand the codebase, docs or files in this project:
-1. ALWAYS query the graph first: `/graphify query "your question"`
-2. Only read raw files if the user explicitly says "read the file" or "look at the raw file"
-3. Use `graphify-out/wiki/index.md` as the entry point to navigate the structure
-```
-
-This is what enables the real token savings.
+Run Studio with **`npm run dev`** (from `src/remotion/`) — it starts Studio **and** the Python **sidecar** (port 9848) together via `concurrently`. The sidecar powers the Subtitles tab's Apply/Fix and the Delete button; `npm run dev:studio` runs Studio alone (those features degrade gracefully). On a Remotion version bump the patches must be re-applied (mechanical) — see `CLAUDE.md` and memory `remotion-studio-custom-tab` / `remotion-native-delete-internals`.
 
 ---
 
@@ -190,7 +129,6 @@ When you finish the installation, leave a message to the user using this templat
 ```
 ✅ Installed:
 - Node v__, Python __, ffmpeg __
-- Graphify v__ with Claude integration
 - Remotion project at video-editor/src/remotion/
 - Skill remotion-dev/skills
 - Initial graph indexed (__ nodes, __ edges)
@@ -211,29 +149,32 @@ To be clear: this setup gets the **environment** ready. The 4 tasks the user act
 
 | Task | Tool | Status |
 |---|---|---|
-| Subtitles | WhisperX (forced alignment) | ✅ Implemented — `2_transcribe.py` |
-| EN→ES translation | WhisperX `translate` mode | Use `--lang es` flag |
-| Cut silences | `ffmpeg silencedetect` | ✅ Implemented — `3_analyze.py` |
-| Cut repetitions | Claude CLI analyzes transcript | ✅ Implemented — `3_analyze.py` |
+| Subtitles | whisper.cpp, DTW token-level timestamps (via `@remotion/install-whisper-cpp`) | ✅ Implemented — `2_transcribe.py` |
+| Transcription language | `--lang` sets the source language (whisper.cpp's own translate is English-only) | Use `--lang es` flag |
+| Cut silences | transcript keep-blocks + `ffmpeg silencedetect` gate | ✅ Implemented — `3_analyze.py` |
+| Cut repetitions | Claude CLI analyzes transcript | ✅ Implemented — `3_analyze.py` (`--repetitions`) |
 | Mode detection (reel vs youtube) | ffprobe on first input video | ✅ Implemented — `1_normalize.py` |
 
-### Install WhisperX (required for step 2)
+### whisper.cpp (required for step 2)
 
-```bash
-pip3 install whisperx --break-system-packages
-# First run downloads the wav2vec2 alignment model (~1GB) to ~/.cache/torch.
-# Everything runs locally — no audio leaves the machine.
-```
+Transcription runs **whisper.cpp locally** (not WhisperX / Python) via `@remotion/install-whisper-cpp`, driven by `src/remotion/scripts/transcribe.mjs`. The build + model live at `<repo>/whisper.cpp/`. Everything runs locally — no audio leaves the machine. There is **nothing to pip-install** for transcription.
 
-The legacy `openai-whisper` package is no longer used by the pipeline. It does not need to be uninstalled.
+The install + model download are handled automatically on the first `2_transcribe.py` run (the Node script calls `installWhisperCpp` + `downloadWhisperModel`). It just needs `node` (≥18) and a C compiler (`make`, present on macOS via Xcode CLT).
+
+**Important — the local `whisper.cpp/main` is a hand-patched v1.5.5** (a DTW short-window guard). `@remotion/install-whisper-cpp` installs the **pristine** v1.5.5, which **crashes** on short trailing windows. So on a fresh checkout (or after re-cloning / resetting `whisper.cpp/`), re-apply the guard before transcribing — see §11 troubleshooting and memory `whisper-dtw-assert-fix`. WhisperX / `openai-whisper` are NOT used and need not be installed.
 
 ---
 
 ## 11. Quick troubleshooting
 
 - **"externally-managed-environment" on `pip install`** → use `--break-system-packages` or `pipx`.
-- **`graphify: command not found`** after installing → `~/.local/bin` missing from PATH (step 3).
 - **`npm run dev` fails with port error** → `lsof -ti:3000 | xargs kill` and retry.
-- **`/graphify` doesn't respond inside Claude Code** → confirm `~/.claude/CLAUDE.md` has the rule and the skill exists at `~/.claude/skills/graphify/`.
 - **Render fails but preview works** → issue with `@remotion/renderer` or ffmpeg, not the code.
 - **`npx create-video@latest` hangs** → use the `git clone` fallback from step 4.
+- **Step 2 crashes with `WHISPER_ASSERT: whisper.cpp:7003: filter_width < a->ne[2]`** → known whisper.cpp v1.5.5 bug: the experimental DTW token-timestamp pass aborts on a window too short for its median filter (a sub-~150ms final window, e.g. a hallucinated trailing "Gracias ."). **The local `whisper.cpp/main` is a hand-patched v1.5.5** — guarded with `n_frames / 2 > 7` at the single DTW call site in `whisper.cpp/whisper.cpp`. A `rm -rf whisper.cpp` / reinstall (or a `git restore`/`git checkout` inside that checkout) reverts to the pristine, **crashing** binary. To re-apply:
+  ```bash
+  cd "<repo>/whisper.cpp"
+  git apply ../src/whisper-dtw-shortwindow-guard.patch   # the saved diff
+  make main                                              # rebuild (~1 min, Apple clang, no cmake)
+  ```
+  A version bump does NOT fix it (the unguarded assert persists to master, and ≥1.7.4 breaks the `@remotion/install-whisper-cpp` make-only build). Full background in memory `whisper-dtw-assert-fix`.
