@@ -1,8 +1,8 @@
 diff --git a/node_modules/@remotion/studio-server/dist/preview-server/routes/apply-codemod.js b/node_modules/@remotion/studio-server/dist/preview-server/routes/apply-codemod.js
-index ec82965..61342b6 100644
+index ec82965..7dc142c 100644
 --- a/node_modules/@remotion/studio-server/dist/preview-server/routes/apply-codemod.js
 +++ b/node_modules/@remotion/studio-server/dist/preview-server/routes/apply-codemod.js
-@@ -64,6 +64,45 @@ const getCodemodUndoDescription = (codemod) => {
+@@ -64,6 +64,109 @@ const getCodemodUndoDescription = (codemod) => {
  const applyCodemodHandler = async ({ input: { codemod, dryRun, symbolicatedStack }, logLevel, remotionRoot, entryPoint, }) => {
      var _a;
      try {
@@ -43,6 +43,70 @@ index ec82965..61342b6 100644
 +                throw new Error((data && data.error) || `sidecar returned ${res.status}`);
 +            }
 +            return { success: true, diff: { additions: 0, deletions: 1 } };
++        }
++        // --- video-editor patch: native "Duplicate composition" → copy project files ---
++        // Same root cause as Delete: recast can't match id={p.name} (.map()'d
++        // composition), so bypass it and copy the project's three folders via the
++        // sidecar's duplicate_project (snapshot name + videoSrc rewritten to newId).
++        // The new snapshot json makes the copy appear in the sidebar on recompile.
++        if (codemod.type === 'duplicate-composition') {
++            const SIDECAR = 'http://127.0.0.1:9848';
++            if (dryRun) {
++                try {
++                    const h = await fetch(`${SIDECAR}/health`);
++                    if (!h.ok) {
++                        throw new Error('bad health');
++                    }
++                }
++                catch (e) {
++                    return {
++                        success: false,
++                        reason: 'Duplicate needs the sidecar (port 9848). Start Studio with `npm run dev`.',
++                    };
++                }
++                return { success: true, diff: { additions: 1, deletions: 0 } };
++            }
++            const res = await fetch(`${SIDECAR}/duplicate-project`, {
++                method: 'POST',
++                headers: { 'content-type': 'application/json' },
++                body: JSON.stringify({ from: codemod.idToDuplicate, to: codemod.newId }),
++            });
++            if (!res.ok) {
++                const data = await res.json().catch(() => ({}));
++                throw new Error((data && data.error) || `sidecar returned ${res.status}`);
++            }
++            return { success: true, diff: { additions: 1, deletions: 0 } };
++        }
++        // --- video-editor patch: native "Rename composition" → move project files ---
++        // Same bypass: rename_project moves the three folders + rewrites/moves the
++        // snapshot (and follows the active-project state file).
++        if (codemod.type === 'rename-composition') {
++            const SIDECAR = 'http://127.0.0.1:9848';
++            if (dryRun) {
++                try {
++                    const h = await fetch(`${SIDECAR}/health`);
++                    if (!h.ok) {
++                        throw new Error('bad health');
++                    }
++                }
++                catch (e) {
++                    return {
++                        success: false,
++                        reason: 'Rename needs the sidecar (port 9848). Start Studio with `npm run dev`.',
++                    };
++                }
++                return { success: true, diff: { additions: 1, deletions: 1 } };
++            }
++            const res = await fetch(`${SIDECAR}/rename-project`, {
++                method: 'POST',
++                headers: { 'content-type': 'application/json' },
++                body: JSON.stringify({ from: codemod.idToRename, to: codemod.newId }),
++            });
++            if (!res.ok) {
++                const data = await res.json().catch(() => ({}));
++                throw new Error((data && data.error) || `sidecar returned ${res.status}`);
++            }
++            return { success: true, diff: { additions: 1, deletions: 1 } };
 +        }
 +        // --- end video-editor patch ---
          const time = Date.now();

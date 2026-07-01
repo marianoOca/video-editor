@@ -17,10 +17,23 @@ from the imported snapshot json, so editing a snapshot updates that project.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 
 from config import REMOTION_DIR, DATA_ROOT, STATE_FILE
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write text via a temp file + os.replace so a watcher never reads a
+    half-written file. Studio's bundler watches ./projects/*.json (require.context)
+    and Root.tsx; a plain truncate-then-write left a window where a mid-write read
+    hit invalid JSON, which failed the whole context module and blanked the
+    composition list ("Composition <id> not found"). os.replace is atomic on the
+    same filesystem, so the temp file sits in the target's own directory."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def snapshot_dir(remotion_dir: Path = REMOTION_DIR) -> Path:
@@ -90,7 +103,7 @@ def write_project_snapshot(
     }
     snap_path = snapshot_path(name, remotion_dir)
     snap_path.parent.mkdir(parents=True, exist_ok=True)
-    snap_path.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False), encoding="utf-8")
+    _atomic_write_text(snap_path, json.dumps(snapshot, indent=2, ensure_ascii=False))
     return snapshot
 
 
@@ -103,8 +116,9 @@ def update_snapshot(name: str, remotion_dir: Path = REMOTION_DIR, **fields) -> d
             f"snapshot for project '{name}' not found — run step 4 (4_render.py) first"
         )
     snap.update(fields)
-    snapshot_path(name, remotion_dir).write_text(
-        json.dumps(snap, indent=2, ensure_ascii=False), encoding="utf-8"
+    _atomic_write_text(
+        snapshot_path(name, remotion_dir),
+        json.dumps(snap, indent=2, ensure_ascii=False),
     )
     return snap
 
@@ -203,9 +217,15 @@ def regenerate_root(remotion_dir: Path = REMOTION_DIR) -> None:
     """Write the constant dynamic Root.tsx (see ROOT_TSX). The composition set is
     discovered at runtime via require.context, so this content never varies with the
     project list — kept as a function (not a static file) so a fresh checkout and
-    `project.py rebuild` can (re)create it. Callers (steps 4/4b, delete) keep working;
-    each call is a harmless idempotent rewrite."""
-    (remotion_dir / "src" / "Root.tsx").write_text(ROOT_TSX, encoding="utf-8")
+    `project.py rebuild` can (re)create it. Callers (steps 4/4b, delete) keep working.
+
+    No-op when the content already matches: ROOT_TSX is constant, so a re-cut/re-run
+    that rewrites it only churns the bundler (each rewrite = a needless Studio
+    recompile, contributing to the re-run flicker). Write only on a real diff."""
+    root = remotion_dir / "src" / "Root.tsx"
+    if root.exists() and root.read_text(encoding="utf-8") == ROOT_TSX:
+        return
+    _atomic_write_text(root, ROOT_TSX)
 
 
 def delete_project(name: str, remotion_dir: Path = REMOTION_DIR) -> list[str]:
@@ -237,3 +257,98 @@ def delete_project(name: str, remotion_dir: Path = REMOTION_DIR) -> list[str]:
 
     regenerate_root(remotion_dir)
     return removed
+
+
+def _assert_free(name: str, remotion_dir: Path = REMOTION_DIR) -> None:
+    """Raise FileExistsError if any of a project's three folders already exist."""
+    if (
+        snapshot_path(name, remotion_dir).exists()
+        or public_project_dir(name, remotion_dir).exists()
+        or (DATA_ROOT / name).exists()
+    ):
+        raise FileExistsError(f"project '{name}' already exists")
+
+
+def duplicate_project(src: str, dst: str, remotion_dir: Path = REMOTION_DIR) -> list[str]:
+    """Copy a project under a new name: public assets + pipeline data + snapshot.
+    The mirror of delete_project (which wipes all three folders). The data dir is
+    copied too so the duplicate is independently re-cuttable via the Subtitles tab
+    (4_render.py reads src/data/<project>/). The snapshot's name + videoSrc are
+    rewritten to point at <dst>. Refuses if <dst> already exists. Returns the list
+    of created paths.
+
+    The Duplicate modal's new dimension/fps/duration fields are intentionally
+    ignored: our composition dims derive from the real edited video, so changing
+    them here would only desync video/captions. A duplicate is a faithful copy."""
+    _assert_free(dst, remotion_dir)
+    snap = read_snapshot(src, remotion_dir)
+    if snap is None:
+        raise FileNotFoundError(f"project '{src}' not found")
+
+    created: list[str] = []
+
+    src_pub = public_project_dir(src, remotion_dir)
+    if src_pub.exists():
+        dst_pub = public_project_dir(dst, remotion_dir)
+        shutil.copytree(src_pub, dst_pub)
+        created.append(str(dst_pub))
+
+    src_data = DATA_ROOT / src
+    if src_data.exists():
+        dst_data = DATA_ROOT / dst
+        shutil.copytree(src_data, dst_data)
+        created.append(str(dst_data))
+
+    snap["name"] = dst
+    snap["videoSrc"] = f"projects/{dst}/edited.mp4"
+    dst_snap = snapshot_path(dst, remotion_dir)
+    dst_snap.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(dst_snap, json.dumps(snap, indent=2, ensure_ascii=False))
+    created.append(str(dst_snap))
+
+    regenerate_root(remotion_dir)
+    return created
+
+
+def rename_project(old: str, new: str, remotion_dir: Path = REMOTION_DIR) -> list[str]:
+    """Rename a project: move its public assets + pipeline data, rewrite + move the
+    snapshot, and follow the active-project state file if it pointed at <old>. The
+    mirror of delete_project, but moving (not removing) the three folders. Refuses
+    if <new> already exists. Returns the list of new paths."""
+    if old == new:
+        raise ValueError("new name equals old name")
+    _assert_free(new, remotion_dir)
+    snap = read_snapshot(old, remotion_dir)
+    if snap is None:
+        raise FileNotFoundError(f"project '{old}' not found")
+
+    moved: list[str] = []
+
+    src_pub = public_project_dir(old, remotion_dir)
+    if src_pub.exists():
+        dst_pub = public_project_dir(new, remotion_dir)
+        shutil.move(str(src_pub), str(dst_pub))
+        moved.append(str(dst_pub))
+
+    src_data = DATA_ROOT / old
+    if src_data.exists():
+        dst_data = DATA_ROOT / new
+        shutil.move(str(src_data), str(dst_data))
+        moved.append(str(dst_data))
+
+    snap["name"] = new
+    snap["videoSrc"] = f"projects/{new}/edited.mp4"
+    new_snap = snapshot_path(new, remotion_dir)
+    new_snap.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(new_snap, json.dumps(snap, indent=2, ensure_ascii=False))
+    moved.append(str(new_snap))
+
+    old_snap = snapshot_path(old, remotion_dir)
+    if old_snap.exists():
+        old_snap.unlink()
+
+    if STATE_FILE.exists() and STATE_FILE.read_text(encoding="utf-8").strip() == old:
+        STATE_FILE.write_text(new, encoding="utf-8")
+
+    regenerate_root(remotion_dir)
+    return moved

@@ -1,3 +1,77 @@
+diff --git a/node_modules/@remotion/studio/dist/components/CompositionSelector.js b/node_modules/@remotion/studio/dist/components/CompositionSelector.js
+index f72d3ac..7921cc5 100644
+--- a/node_modules/@remotion/studio/dist/components/CompositionSelector.js
++++ b/node_modules/@remotion/studio/dist/components/CompositionSelector.js
+@@ -15,6 +15,9 @@ const z_index_1 = require("../state/z-index");
+ const CompositionSelectorItem_1 = require("./CompositionSelectorItem");
+ const CurrentComposition_1 = require("./CurrentComposition");
+ const InitialCompositionLoader_1 = require("./InitialCompositionLoader");
++const NewProjectLauncher_1 = require("../../../../../src/studio/NewProjectLauncher");
++const RerunLauncher_1 = require("../../../../../src/studio/RerunLauncher");
++const NEW_PROJECT_BUTTON_HEIGHT = 36;
+ const useCompositionNavigation = () => {
+     const { compositions, canvasContent } = (0, react_1.useContext)(remotion_1.Internals.CompositionManager);
+     const selectComposition = (0, InitialCompositionLoader_1.useSelectComposition)();
+@@ -99,7 +102,7 @@ const CompositionSelector = () => {
+     }, [sortedCompositions, sortedFolders, foldersExpanded]);
+     const list = (0, react_1.useMemo)(() => {
+         return {
+-            height: `calc(100% - ${CurrentComposition_1.CURRENT_COMPOSITION_HEIGHT}px - ${QUICK_SWITCHER_TRIGGER_HEIGHT}px)`,
++            height: `calc(100% - ${CurrentComposition_1.CURRENT_COMPOSITION_HEIGHT}px - ${QUICK_SWITCHER_TRIGGER_HEIGHT}px - ${NEW_PROJECT_BUTTON_HEIGHT}px)`,
+             overflowY: 'auto',
+         };
+     }, []);
+@@ -115,11 +118,11 @@ const CompositionSelector = () => {
+         });
+     }, [setSelectedModal]);
+     return (jsx_runtime_1.jsxs("div", { style: container, children: [
+-            jsx_runtime_1.jsx(CurrentComposition_1.CurrentComposition, {}), jsx_runtime_1.jsx("div", { style: quickSwitcherArea, children: jsx_runtime_1.jsxs("button", { type: "button", style: quickSwitcherTrigger, onClick: openQuickSwitcher, tabIndex: tabIndex, children: ["Search...", (0, use_keybinding_1.areKeyboardShortcutsDisabled)() ? null : (jsx_runtime_1.jsxs("span", { style: shortcutLabel, children: [ShortcutHint_1.cmdOrCtrlCharacter, "+K"] }))] }) }), jsx_runtime_1.jsx("div", { className: "__remotion-vertical-scrollbar", style: list, children: items.map((c) => {
++            jsx_runtime_1.jsx(CurrentComposition_1.CurrentComposition, {}), jsx_runtime_1.jsx("div", { style: quickSwitcherArea, children: jsx_runtime_1.jsxs("button", { type: "button", style: quickSwitcherTrigger, onClick: openQuickSwitcher, tabIndex: tabIndex, children: ["Search...", (0, use_keybinding_1.areKeyboardShortcutsDisabled)() ? null : (jsx_runtime_1.jsxs("span", { style: shortcutLabel, children: [ShortcutHint_1.cmdOrCtrlCharacter, "+K"] }))] }) }), jsx_runtime_1.jsx(NewProjectLauncher_1.NewProjectLauncher, {}), jsx_runtime_1.jsx(RerunLauncher_1.RerunLauncher, {}), jsx_runtime_1.jsxs("div", { className: "__remotion-vertical-scrollbar", style: list, children: [jsx_runtime_1.jsx(NewProjectLauncher_1.BuildSelectGuard, {}, "__build_guard"), jsx_runtime_1.jsx(NewProjectLauncher_1.SyntheticBuildRow, { fallback: true }, "__build_synthetic"), items.map((c) => {
+                     return (jsx_runtime_1.jsx(CompositionSelectorItem_1.CompositionSelectorItem, { level: 0, currentComposition: canvasContent && canvasContent.type === 'composition'
+                             ? canvasContent.compositionId
+                             : null, selectComposition: selectComposition, toggleFolder: toggleFolder, tabIndex: tabIndex, item: c }, c.key + c.type));
+-                }) })
++                })] })
+         ] }));
+ };
+ exports.CompositionSelector = CompositionSelector;
+diff --git a/node_modules/@remotion/studio/dist/components/CompositionSelectorItem.js b/node_modules/@remotion/studio/dist/components/CompositionSelectorItem.js
+index 60b8033..2c07e5f 100644
+--- a/node_modules/@remotion/studio/dist/components/CompositionSelectorItem.js
++++ b/node_modules/@remotion/studio/dist/components/CompositionSelectorItem.js
+@@ -19,6 +19,7 @@ const folder_menu_items_1 = require("./folder-menu-items");
+ const layout_1 = require("./layout");
+ const SidebarRenderButton_1 = require("./SidebarRenderButton");
+ const use_resolved_stack_1 = require("./Timeline/use-resolved-stack");
++const NewProjectLauncher_1 = require("../../../../../src/studio/NewProjectLauncher");
+ const COMPOSITION_ITEM_HEIGHT = 32;
+ const itemStyle = {
+     paddingRight: 10,
+@@ -94,6 +95,9 @@ const CompositionSelectorItem = ({ item, level, currentComposition, tabIndex, se
+     const onClick = (0, react_1.useCallback)((evt) => {
+         evt.preventDefault();
+         if (item.type === 'composition') {
++            if (NewProjectLauncher_1.isBuildBlocked(item.composition.id)) {
++                return;
++            }
+             (0, sidebar_scroll_into_view_1.markCompositionSidebarScrollFromRowClick)(item.composition.id);
+             selectComposition(item.composition, true);
+         }
+@@ -137,9 +141,11 @@ const CompositionSelectorItem = ({ item, level, currentComposition, tabIndex, se
+                     ? item.items.map((childItem) => {
+                         return (jsx_runtime_1.jsx(exports.CompositionSelectorItem, { currentComposition: currentComposition, selectComposition: selectComposition, item: childItem, tabIndex: tabIndex, level: level + 1, toggleFolder: toggleFolder }, childItem.key + childItem.type));
+                     })
+-                    : null] }));
++                    : null, (item.expanded && item.folderName === 'Projects'
++                    ? jsx_runtime_1.jsx(NewProjectLauncher_1.SyntheticBuildRow, { level: level + 1 }, "__build_synthetic_folder")
++                    : null)] }));
+     }
+-    return (jsx_runtime_1.jsx(ContextMenu_1.ContextMenu, { values: contextMenu, onOpen: null, children: jsx_runtime_1.jsx(layout_1.Row, { align: "center", children: jsx_runtime_1.jsxs("a", { ref: compositionRowRef, style: style, onPointerEnter: onPointerEnter, onPointerLeave: onPointerLeave, tabIndex: tabIndex, onClick: onClick, onKeyDown: onKeyDown, type: "button", title: item.composition.id, className: "__remotion-composition", "data-compname": item.composition.id, children: [(0, is_composition_still_1.isCompositionStill)(item.composition) ? (jsx_runtime_1.jsx(still_1.StillIcon, { color: hovered || selected ? 'white' : colors_1.LIGHT_TEXT, style: iconStyle })) : (jsx_runtime_1.jsx(video_1.FilmIcon, { color: hovered || selected ? 'white' : colors_1.LIGHT_TEXT, style: iconStyle })), jsx_runtime_1.jsx(layout_1.Spacing, { x: 1 }), jsx_runtime_1.jsx("div", { style: label, children: item.composition.id }), jsx_runtime_1.jsx(layout_1.Spacing, { x: 0.5 }), jsx_runtime_1.jsx(CompositionContextButton_1.CompositionContextButton, { values: contextMenu, visible: hovered }), jsx_runtime_1.jsx(SidebarRenderButton_1.SidebarRenderButton, { visible: hovered, composition: item.composition })
+-                ] }) }) }));
++    return (jsx_runtime_1.jsxs(jsx_runtime_1.Fragment, { children: [jsx_runtime_1.jsx(ContextMenu_1.ContextMenu, { values: contextMenu, onOpen: null, children: jsx_runtime_1.jsx(layout_1.Row, { align: "center", children: jsx_runtime_1.jsxs("a", { ref: compositionRowRef, style: style, onPointerEnter: onPointerEnter, onPointerLeave: onPointerLeave, tabIndex: tabIndex, onClick: onClick, onKeyDown: onKeyDown, type: "button", title: item.composition.id, className: "__remotion-composition", "data-compname": item.composition.id, children: [(0, is_composition_still_1.isCompositionStill)(item.composition) ? (jsx_runtime_1.jsx(still_1.StillIcon, { color: hovered || selected ? 'white' : colors_1.LIGHT_TEXT, style: iconStyle })) : (jsx_runtime_1.jsx(video_1.FilmIcon, { color: hovered || selected ? 'white' : colors_1.LIGHT_TEXT, style: iconStyle })), jsx_runtime_1.jsx(layout_1.Spacing, { x: 1 }), jsx_runtime_1.jsx("div", { style: label, children: item.composition.id }), jsx_runtime_1.jsx(layout_1.Spacing, { x: 0.5 }), jsx_runtime_1.jsx(CompositionContextButton_1.CompositionContextButton, { values: contextMenu, visible: hovered }), jsx_runtime_1.jsx(SidebarRenderButton_1.SidebarRenderButton, { visible: hovered, composition: item.composition })
++                ] }) }) }), jsx_runtime_1.jsx(NewProjectLauncher_1.CompositionBuildBar, { compositionId: item.composition.id, level: level })] }));
+ };
+ exports.CompositionSelectorItem = CompositionSelectorItem;
 diff --git a/node_modules/@remotion/studio/dist/components/NewComposition/DeleteComposition.js b/node_modules/@remotion/studio/dist/components/NewComposition/DeleteComposition.js
 index c612cf4..e1e2194 100644
 --- a/node_modules/@remotion/studio/dist/components/NewComposition/DeleteComposition.js
@@ -20,7 +94,7 @@ index c612cf4..e1e2194 100644
          ] }));
  };
 diff --git a/node_modules/@remotion/studio/dist/components/NewComposition/DiffPreview.js b/node_modules/@remotion/studio/dist/components/NewComposition/DiffPreview.js
-index 7de339f..b022531 100644
+index 7de339f..ed4cae8 100644
 --- a/node_modules/@remotion/studio/dist/components/NewComposition/DiffPreview.js
 +++ b/node_modules/@remotion/studio/dist/components/NewComposition/DiffPreview.js
 @@ -11,7 +11,7 @@ const CodemodDiffPreview = ({ status }) => {
@@ -28,10 +102,57 @@ index 7de339f..b022531 100644
      }
      return (jsx_runtime_1.jsxs("div", { style: { lineHeight: 1.2 }, children: [
 -            jsx_runtime_1.jsx("span", { style: { color: colors_1.LIGHT_TEXT, fontSize: 13, lineHeight: 1.2 }, children: "This will edit your codebase." }), jsx_runtime_1.jsx("br", {}), jsx_runtime_1.jsxs("span", { style: { color: colors_1.BLUE, fontSize: 13, lineHeight: 1.2 }, children: [status.diff.additions, " addition", status.diff.additions === 1 ? '' : 's', ","] }), ' ', jsx_runtime_1.jsxs("span", { style: {
-+            jsx_runtime_1.jsx("span", { style: { color: colors_1.LIGHT_TEXT, fontSize: 13, lineHeight: 1.2 }, children: "This will permanently delete the project's files." }), jsx_runtime_1.jsx("br", {}), jsx_runtime_1.jsxs("span", { style: { color: colors_1.BLUE, fontSize: 13, lineHeight: 1.2 }, children: [status.diff.additions, " addition", status.diff.additions === 1 ? '' : 's', ","] }), ' ', jsx_runtime_1.jsxs("span", { style: {
++            jsx_runtime_1.jsx("span", { style: { color: colors_1.LIGHT_TEXT, fontSize: 13, lineHeight: 1.2 }, children: "This will update the project's files on disk." }), jsx_runtime_1.jsx("br", {}), jsx_runtime_1.jsxs("span", { style: { color: colors_1.BLUE, fontSize: 13, lineHeight: 1.2 }, children: [status.diff.additions, " addition", status.diff.additions === 1 ? '' : 's', ","] }), ' ', jsx_runtime_1.jsxs("span", { style: {
                      color: colors_1.SELECTED_GUIDE,
                      fontSize: 13,
                      lineHeight: 1.2,
+diff --git a/node_modules/@remotion/studio/dist/components/NewComposition/DuplicateComposition.js b/node_modules/@remotion/studio/dist/components/NewComposition/DuplicateComposition.js
+index 62a5e22..76453ae 100644
+--- a/node_modules/@remotion/studio/dist/components/NewComposition/DuplicateComposition.js
++++ b/node_modules/@remotion/studio/dist/components/NewComposition/DuplicateComposition.js
+@@ -201,7 +201,7 @@ const DuplicateCompositionLoaded = ({ initialType }) => {
+                                         ] })
+                                 ] })) : null, type === 'composition' && hadDurationDefined ? (jsx_runtime_1.jsx(NewCompDuration_1.NewCompDuration, { durationInFrames: durationInFrames, setDurationInFrames: setDurationInFrames })) : null, type === 'composition' && hadFpsDefined ? (jsx_runtime_1.jsxs("div", { style: layout_2.optionRow, children: [
+                                     jsx_runtime_1.jsx("div", { style: layout_2.label, children: "FPS" }), jsx_runtime_1.jsx("div", { style: layout_2.rightRow, children: jsx_runtime_1.jsx(InputDragger_1.InputDragger, { type: "number", value: selectedFrameRate, onTextChange: onTextFpsChange, placeholder: "Frame rate (fps)", name: "fps", min: 1, required: true, status: "ok", max: 240, step: 0.01, onValueChange: onFpsChange, rightAlign: false }) })
+-                                ] })) : null] }), jsx_runtime_1.jsx(ModalFooter_1.ModalFooterContainer, { children: jsx_runtime_1.jsx(CodemodFooter_1.CodemodFooter, { loadingNotification: 'Duplicating...', errorNotification: 'Could not duplicate composition', successNotification: `Duplicated ${unresolved.id} as ${newId}`, genericSubmitLabel: 'Duplicate', submitLabel: ({ relativeRootPath }) => `Add to ${relativeRootPath}`, codemod: codemod, stack: compositionStack, valid: valid, onSuccess: onDuplicateSuccess }) })
++                                ] })) : null] }), jsx_runtime_1.jsx(ModalFooter_1.ModalFooterContainer, { children: jsx_runtime_1.jsx(CodemodFooter_1.CodemodFooter, { loadingNotification: 'Duplicating...', errorNotification: 'Could not duplicate project', successNotification: `Duplicated ${unresolved.id} as ${newId}`, genericSubmitLabel: 'Duplicate project', submitLabel: () => 'Duplicate project', codemod: codemod, stack: compositionStack, valid: valid, onSuccess: onDuplicateSuccess }) })
+                 ] })
+         ] }));
+ };
+diff --git a/node_modules/@remotion/studio/dist/components/NewComposition/RenameComposition.js b/node_modules/@remotion/studio/dist/components/NewComposition/RenameComposition.js
+index d221b21..e3fcc43 100644
+--- a/node_modules/@remotion/studio/dist/components/NewComposition/RenameComposition.js
++++ b/node_modules/@remotion/studio/dist/components/NewComposition/RenameComposition.js
+@@ -4,6 +4,7 @@ exports.RenameComposition = void 0;
+ const jsx_runtime_1 = require("react/jsx-runtime");
+ const react_1 = require("react");
+ const remotion_1 = require("remotion");
++const url_state_1 = require("../../helpers/url-state");
+ const validate_new_comp_data_1 = require("../../helpers/validate-new-comp-data");
+ const layout_1 = require("../layout");
+ const ModalFooter_1 = require("../ModalFooter");
+@@ -54,6 +55,12 @@ const RenameCompositionLoaded = () => {
+             newId,
+         };
+     }, [newId, resolved.result.id]);
++    const onRenameSuccess = (0, react_1.useCallback)(() => {
++        // video-editor patch: the old id is gone after rename (sidebar updates on
++        // recompile), so navigate to the new one — otherwise the canvas sits on
++        // "Composition not found" until the user reselects. Mirrors Duplicate.
++        (0, url_state_1.pushUrl)(`/${newId}`);
++    }, [newId]);
+     const onSubmit = (0, react_1.useCallback)((e) => {
+         e.preventDefault();
+     }, []);
+@@ -64,7 +71,7 @@ const RenameCompositionLoaded = () => {
+                                             jsx_runtime_1.jsx(RemInput_1.RemotionInput, { ref: inputRef, value: newId, onChange: onNameChange, type: "text", autoFocus: true, placeholder: "Composition ID", status: "ok", rightAlign: true }), compNameErrMessage ? (jsx_runtime_1.jsxs(jsx_runtime_1.Fragment, { children: [
+                                                     jsx_runtime_1.jsx(layout_1.Spacing, { y: 1, block: true }), jsx_runtime_1.jsx(ValidationMessage_1.ValidationMessage, { align: "flex-start", message: compNameErrMessage, type: "error" })
+                                                 ] })) : null] }) })
+-                            ] }) }), jsx_runtime_1.jsx(ModalFooter_1.ModalFooterContainer, { children: jsx_runtime_1.jsx(CodemodFooter_1.CodemodFooter, { loadingNotification: 'Renaming...', errorNotification: 'Could not rename composition', successNotification: `Renamed to ${newId}`, genericSubmitLabel: 'Rename', submitLabel: ({ relativeRootPath }) => `Modify ${relativeRootPath}`, codemod: codemod, stack: compositionStack, valid: valid, onSuccess: null }) })
++                            ] }) }), jsx_runtime_1.jsx(ModalFooter_1.ModalFooterContainer, { children: jsx_runtime_1.jsx(CodemodFooter_1.CodemodFooter, { loadingNotification: 'Renaming...', errorNotification: 'Could not rename project', successNotification: `Renamed to ${newId}`, genericSubmitLabel: 'Rename project', submitLabel: () => 'Rename project', codemod: codemod, stack: compositionStack, valid: valid, onSuccess: onRenameSuccess }) })
+                 ] })
+         ] }));
+ };
 diff --git a/node_modules/@remotion/studio/dist/components/OptionsPanel.js b/node_modules/@remotion/studio/dist/components/OptionsPanel.js
 index b04bbd1..ddb06c9 100644
 --- a/node_modules/@remotion/studio/dist/components/OptionsPanel.js
@@ -72,3 +193,37 @@ index b04bbd1..ddb06c9 100644
 +            jsx_runtime_1.jsx("div", { style: tabsContainer, children: jsx_runtime_1.jsxs(Tabs_1.Tabs, { children: [jsx_runtime_1.jsx(Tabs_1.Tab, { selected: panel === 'subtitles', onClick: onSubtitlesSelected, children: "Subtitles" }), visualControlsTabActivated ? (jsx_runtime_1.jsx(Tabs_1.Tab, { selected: panel === 'visual-controls', onClick: onVisualControlsSelected, children: "Controls" })) : null, jsx_runtime_1.jsxs(Tabs_1.Tab, { selected: panel === 'input-props', onClick: onPropsSelected, style: { justifyContent: 'space-between' }, children: ["Props", hasLocalModifications ? (jsx_runtime_1.jsx(SchemaResetButton_1.SchemaResetButton, { onClick: resetToOriginal })) : null] }), renderingAvailable ? (jsx_runtime_1.jsx(RendersTab_1.RendersTab, { onClick: onRendersSelected, selected: panel === 'renders' })) : null] }) }), panel === 'input-props' ? (composition ? (jsx_runtime_1.jsx(DefaultPropsEditor_1.DefaultPropsEditor, { unresolvedComposition: composition, defaultProps: currentDefaultProps, setDefaultProps: setDefaultProps, propsEditType: "default-props" }, composition.id)) : null) : panel === 'visual-controls' && visualControlsTabActivated ? (jsx_runtime_1.jsx(VisualControlsContent_1.VisualControlsContent, {})) : panel === 'subtitles' ? (jsx_runtime_1.jsx(SubtitlesTab_1.SubtitlesTab, { key: currentDefaultProps?.project, defaultProps: currentDefaultProps, setDefaultProps: setDefaultProps })) :!renderingAvailable ? null : (jsx_runtime_1.jsx(RenderQueue_1.RenderQueue, {}))] }));
  };
  exports.OptionsPanel = OptionsPanel;
+diff --git a/node_modules/@remotion/studio/dist/components/composition-menu-items.js b/node_modules/@remotion/studio/dist/components/composition-menu-items.js
+index 26f13c9..658d67e 100644
+--- a/node_modules/@remotion/studio/dist/components/composition-menu-items.js
++++ b/node_modules/@remotion/studio/dist/components/composition-menu-items.js
+@@ -99,6 +99,29 @@ const getCompositionMenuItems = ({ composition, connectionStatus, resolvedLocati
+                 id: 'show-in-editor-divider',
+             }
+             : null,
++        {
++            // video-editor patch: re-run the pipeline for this project from a chosen
++            // step. Remotion has no public API to open a custom Studio modal, so the
++            // click bridges to the project-owned RerunLauncher.tsx via a window event.
++            id: 're-run-pipeline',
++            keyHint: null,
++            label: `Re-run pipeline...`,
++            leftItem: null,
++            onClick: () => {
++                if (!composition) {
++                    return;
++                }
++                closeMenu();
++                window.dispatchEvent(new CustomEvent('ve-rerun-pipeline', {
++                    detail: { project: composition.id },
++                }));
++            },
++            quickSwitcherLabel: 'Re-run pipeline...',
++            subMenu: null,
++            type: 'item',
++            value: 're-run-pipeline',
++            disabled: !composition || readOnlyStudio,
++        },
+         {
+             id: 'rename',
+             keyHint: null,

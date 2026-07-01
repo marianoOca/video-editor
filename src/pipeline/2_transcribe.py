@@ -40,6 +40,13 @@ SEGMENT_GAP_SEC = 1.0
 # capped here — otherwise a word before a pause stretches across the whole gap.
 MAX_WORD_DUR = 0.7
 
+# Spoken multi-word numbers ("ciento veinte", "dos mil veinticuatro") collapse into a
+# single digit token ("120", "2024"); the 0.7s cap then truncates the word to its first
+# syllables and the rest is cut as a phantom no-speech gap (see merge_tokens_to_words
+# note re "ciento veinte"->"120"). Numeric tokens get a wider cap so the keep block covers
+# the whole spoken number. 3.0s covers any number a person says aloud in one breath.
+MAX_NUM_WORD_DUR = 3.0
+
 # Word-timestamp repair (transcript-internal, no energy). Whisper's DTW onset can
 # hallucinate a LOW-confidence token's start backward into a pause; its char-offset
 # (which tiles within contiguous speech) is then the better onset. See
@@ -60,7 +67,7 @@ CHUNK_MIN_SEC = 20.0        # never emit a chunk shorter than this (absorb the t
 CHUNK_EDGE_PAD = 0.25       # seconds — keep this much silence around each chunk's
                             # speech; a longer trailing silence crashes whisper.cpp's
                             # DTW pass (WHISPER_ASSERT filter_width < a->ne[2])
-CHUNK_SILENCE_DB = -35      # dB — split only in confident pauses (quieter than this)
+CHUNK_SILENCE_DB = -30      # dB — split only in confident pauses (quieter than this)
 CHUNK_SILENCE_MIN = 0.5     # seconds — min pause length to be a split candidate
 
 
@@ -315,7 +322,8 @@ def merge_tokens_to_words(captions: list[dict]) -> tuple[list[dict], list[dict]]
             words[i]["start"] = words[i - 1]["start"]
     for i, w in enumerate(words):
         next_start = words[i + 1]["start"] if i + 1 < len(words) else w["start"] + MAX_WORD_DUR
-        w["end"] = min(max(next_start, w["start"]), w["start"] + MAX_WORD_DUR)
+        cap = MAX_NUM_WORD_DUR if re.match(r"\s*\d[\d.,]*", w["word"]) else MAX_WORD_DUR
+        w["end"] = min(max(next_start, w["start"]), w["start"] + cap)
     return words, nonspeech
 
 

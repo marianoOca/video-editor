@@ -121,22 +121,26 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["reel", "youtube"], default=None,
                         help="Force mode (default: auto-detect from first video)")
-    parser.add_argument("--input", default=None,
-                        help="Process only this file (absolute, relative to cwd, or bare name resolved in input/)")
+    parser.add_argument("--input", nargs="+", default=None,
+                        help="Process only these file(s), merged in the given order. Each is an "
+                             "absolute path, relative to cwd, or a bare name resolved in input/.")
     args = parser.parse_args()
 
     if args.input:
-        p = Path(args.input)
-        if not p.is_absolute():
-            # Try relative to cwd first, then fall back to input/ so a bare
-            # filename (e.g. --input prueba1.mp4) resolves to input/prueba1.mp4.
-            cwd_p = Path.cwd() / p
-            input_p = INPUT_DIR / p
-            p = cwd_p if cwd_p.exists() else input_p
-        if not p.exists():
-            print(f"ERROR: --input file not found: {p}")
-            sys.exit(1)
-        videos = [p]
+        # Resolve each input in order so the merge order matches the selection.
+        videos = []
+        for name in args.input:
+            p = Path(name)
+            if not p.is_absolute():
+                # Try relative to cwd first, then fall back to input/ so a bare
+                # filename (e.g. --input prueba1.mp4) resolves to input/prueba1.mp4.
+                cwd_p = Path.cwd() / p
+                input_p = INPUT_DIR / p
+                p = cwd_p if cwd_p.exists() else input_p
+            if not p.exists():
+                print(f"ERROR: --input file not found: {p}")
+                sys.exit(1)
+            videos.append(p)
     else:
         videos = sorted([v for ext in ("*.mp4", "*.mov") for v in INPUT_DIR.glob(ext)])
     if not videos:

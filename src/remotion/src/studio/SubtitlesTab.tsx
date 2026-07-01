@@ -439,8 +439,9 @@ export const SubtitlesTab: React.FC<{
 
   // ── Project health (corrupt-file detection + Fix) ───────────────────────────
   const [health, setHealth] = useState<{ corrupt: boolean; resumeStep: number | null } | null>(null);
-  const [fixing, setFixing] = useState(false);
-  const busy = applying || fixing;
+  // Fix runs as a background job tracked by the sidebar's in-list progress bar (same
+  // as "Re-run pipeline"), so only Apply drives the tab's own progress bar.
+  const busy = applying;
 
   // ── Auto-scroll (follow the playhead) ───────────────────────────────────────
   // The playhead arrives via window.__veSubtitleFrame, published by FrameBridge
@@ -588,9 +589,10 @@ export const SubtitlesTab: React.FC<{
     return () => cancelAnimationFrame(raf);
   }, []);
 
-  // Fill progress bar while applying OR fixing. No real signal from the sidecar
-  // (one blocking POST), so fill LINEARLY at a rate scaled to the video length —
-  // a longer video means a longer re-cut — reaching the 90% cap at ~that time.
+  // Fill progress bar while applying. No real signal from the sidecar (one blocking
+  // POST), so fill LINEARLY at a rate scaled to the video length — a longer video
+  // means a longer re-cut — reaching the 90% cap at ~that time. (Fix is a background
+  // job; its progress shows in the sidebar's in-list bar, not here.)
   // Linear (not eased) so the bar keeps moving the whole time instead of pinning
   // near the end. Snaps to 100% on success (applySuccessRef), resets on error.
   useEffect(() => {
@@ -997,13 +999,15 @@ export const SubtitlesTab: React.FC<{
     }
   };
 
-  // Repair a corrupt project: POST to the sidecar, which regenerates edited.mp4 +
-  // the snapshot from the last valid pipeline step (no Studio re-open, no final
-  // render). Reuses the Apply progress bar (busy); clears the banner on success —
-  // HMR reloads the repaired composition.
+  // Repair a corrupt project: kick off the pipeline re-run from the last valid step
+  // as a BACKGROUND JOB, then hand it off to the sidebar's in-list progress bar —
+  // exactly like the "Re-run pipeline" menu, so the UX is consistent everywhere. The
+  // sidecar spawns run_all.py and returns immediately; NewProjectLauncher's build
+  // store catches `ve-job-started` and shows the bar under the project's row. Clear
+  // the banner optimistically; the job's completion HMR-reloads the repaired
+  // composition and the health probe re-runs. (A failure surfaces in the in-list bar.)
   const fixProject = async () => {
-    if (!project || fixing) return;
-    setFixing(true);
+    if (!project) return;
     setApplyError(null);
     try {
       const res = await fetch(FIX_URL, {
@@ -1011,11 +1015,13 @@ export const SubtitlesTab: React.FC<{
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ project }),
       });
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.log || data.error || `sidecar error ${res.status}`);
+        throw new Error(data.error || data.log || `sidecar error ${res.status}`);
       }
-      applySuccessRef.current = true; // snap the progress bar to 100%
+      window.dispatchEvent(
+        new CustomEvent("ve-job-started", { detail: { project: data.project || project } })
+      );
       setHealth({ corrupt: false, resumeStep: null });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -1024,8 +1030,6 @@ export const SubtitlesTab: React.FC<{
           ? "Sidecar not running — start it: cd src/pipeline && python3 sidecar.py"
           : msg
       );
-    } finally {
-      setFixing(false);
     }
   };
 
@@ -1095,12 +1099,12 @@ export const SubtitlesTab: React.FC<{
               : "."}
           </span>
           <button
-            style={applyBtn(true, fixing)}
+            style={applyBtn(true, false)}
             onClick={fixProject}
-            disabled={fixing}
-            title="Regenerate edited.mp4 + snapshot from the last valid step"
+            disabled={!project}
+            title="Re-run the pipeline from the last valid step (progress shows under the project in the list)"
           >
-            {fixing ? "Fixing…" : "Fix"}
+            Fix
           </button>
         </div>
       )}

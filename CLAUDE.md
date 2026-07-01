@@ -1,3 +1,22 @@
+# Identity
+
+You are helping Mariano with eding their personal brand videos using remotion, improving and fine tunning such tool, as you interact with him and he's videos.
+
+## Rules
+- Write in plain, clear language
+- Ask clarifying questions before making assumptions
+- When you are unsure, say so
+
+## Companion files — read at session start, maintain as you go
+
+This file (CLAUDE.md) is the durable manual: **how the project works** (architecture, pipeline, commands). It changes only when the architecture does.
+
+Two companion files in `src/` are NOT auto-loaded — read them when relevant and keep them current:
+- **`src/CONTEXT.md`** — current state: active focus, open issues, what's deferred. Update when focus shifts or an issue opens/closes.
+- **`src/REFERENCES.md`** — pointers: external links, related repos, memory index, key docs. Update when a durable resource appears.
+
+Maintenance rule (all three files + memory): add only durable, reusable facts. No one-off edge cases, no padding. If a fact is "this very specific thing, unlikely to recur," discard it.
+
 ## Project structure
 
 ```
@@ -14,6 +33,8 @@ video-editor/
 │   └── skills/remotion-best-practices -> ../.agents/skills/remotion-best-practices (symlink)
 └── src/
     ├── SETUP.md                  # installation instructions
+    ├── CONTEXT.md                # current state: focus, open issues, deferred (companion to CLAUDE.md)
+    ├── REFERENCES.md             # pointers: links, related repos, memory index, docs (companion to CLAUDE.md)
     ├── skills-lock.json          # canonical skills lock (single source of truth)
     ├── data/                     # per-project intermediates: src/data/<project>/...
     │   ├── <project>/            # one workspace per edit (name = video stem)
@@ -28,9 +49,9 @@ video-editor/
     │   └── audio.json            # audio metadata
     ├── pipeline/                 # Python pipeline scripts
     │   ├── config.py             # shared constants + active-project resolution (OUT_DIR=src/data/<active>/)
-    │   ├── remotion_sync.py      # multi-tenant Remotion store: write_project_snapshot(), regenerate_root()
+    │   ├── remotion_sync.py      # multi-tenant Remotion store: write_project_snapshot(), regenerate_root(), duplicate_project(), rename_project(), delete_project() — atomic writes via os.replace
     │   ├── project.py            # project CLI: list/current/switch/rebuild/delete
-    │   ├── sidecar.py            # local HTTP server (port 9843): Studio Subtitles tab POSTs here to re-cut
+    │   ├── sidecar.py            # local HTTP server (port 9848): background pipeline job runner + Subtitles-tab re-cut (endpoints in the Compositions/Subtitles tab sections)
     │   ├── srt_utils.py          # shared utilities: ms_to_srt(), srt_to_ms()
     │   ├── 1_normalize.py        # detect mode, normalize videos to target res @ 30fps, concatenate → data/combined.mp4 + data/mode.json
     │   ├── 2_transcribe.py       # transcribe with WhisperX (forced alignment) → data/transcript.json
@@ -55,7 +76,11 @@ video-editor/
             ├── Composition.tsx   # VideoComposition: video + ImageOverlayLayer + CaptionOverlay
             ├── CaptionOverlay.tsx # renders captions with active-word highlight; inline editor in Studio
             ├── ImageOverlay.tsx  # image overlays with fade in/out; drag-to-reposition in Studio
-            └── schema.ts         # zod schema: CaptionSegment, ImageOverlay, CompositionProps
+            ├── schema.ts         # zod schema: CaptionSegment, ImageOverlay, CompositionProps
+            └── studio/           # project-owned Studio-chrome components (injected into patched Studio files)
+                ├── SubtitlesTab.tsx        # Subtitles tab panel
+                ├── NewProjectLauncher.tsx  # "+ New project" modal + build store (progress shows in the composition list)
+                └── RerunLauncher.tsx       # "Re-run pipeline" modal (composition context-menu triggered)
 ```
 
 ## Pipeline — full flow
@@ -143,7 +168,43 @@ python3 project.py rebuild          # rewrite Root.tsx (constant dynamic form)
 python3 project.py delete <name>    # remove a project ENTIRELY (data + snapshot + public + state)
 ```
 
-**Deleting a project** — one consolidated deleter, `remotion_sync.delete_project(name)`, wipes all of: `src/data/<name>/`, `src/remotion/src/projects/<name>.json`, `src/remotion/public/projects/<name>/`, and clears `.ve_active_project` if it pointed there (idempotent; returns the removed-paths list). Three callers share it: `project.py delete`, the sidecar `POST /delete-project`, and **Studio's native "Delete composition"** (sidebar context menu → Delete). Because Root.tsx discovers projects dynamically, the composition drops from the sidebar on the next recompile with no manual reload. (Native Delete is made to work via two `patch-package` patches — `@remotion/studio-server` handler + `@remotion/studio` dialog copy; deep notes + re-apply steps in memory `remotion-native-delete-internals`. The server patch needs a `npm run dev` restart after install.)
+**Deleting a project** — one consolidated deleter, `remotion_sync.delete_project(name)`, wipes all of: `src/data/<name>/`, `src/remotion/src/projects/<name>.json`, `src/remotion/public/projects/<name>/`, and clears `.ve_active_project` if it pointed there (idempotent; returns the removed-paths list). Three callers share it: `project.py delete`, the sidecar `POST /delete-project`, and **Studio's native "Delete composition"** (sidebar context menu → Delete). Because Root.tsx discovers projects dynamically, the composition drops from the sidebar on the next recompile with no manual reload. (Native Delete is made to work via two `patch-package` patches — `@remotion/studio-server` handler + `@remotion/studio` dialog copy; deep notes + re-apply steps in memory `remotion-native-delete-internals`. The server patch needs a `npm run dev` restart after install.) Native **Rename** and **Duplicate** work the same way — see the Compositions tab section below.
+
+## Studio "Compositions" tab (project manager, custom Studio chrome via patch-package)
+
+The left-sidebar Compositions panel is a full project manager, wired via the same `patch-package`
+approach as the Subtitles tab (breaks on Remotion version bumps — re-apply via postinstall). Four
+capabilities, all backed by the sidecar's background job runner. Launcher components are
+project-owned (`src/remotion/src/studio/*.tsx`), editable without re-patching; the patched Studio
+files just `require(...)` them across the node_modules boundary.
+
+- **+ New project** (`NewProjectLauncher.tsx`): button above the composition list → modal that stages
+  video(s) into `input/` three ways — drag-drop upload (`/upload-video`), reference a local path with
+  no copy (`/import-path`), or pick existing `input/` files — then pick which to merge, name the
+  project (collision/overwrite handled), and kick off `run_all.py` 1–6 as a background job
+  (`/run-pipeline`).
+- **Re-run pipeline** (`RerunLauncher.tsx`): composition context-menu item → modal to re-run
+  `run_all.py --from N` for that project (`/rerun-pipeline`). No visible trigger of its own — the menu
+  item dispatches a `ve-rerun-pipeline` window event the launcher listens for.
+- **Rename / Duplicate**: Studio's native composition menu (previously broken on this dynamic-Root
+  setup). The `@remotion/studio-server` `apply-codemod` handler is patched to **bypass** its Root.tsx
+  codemod and call the sidecar instead — `/rename-project` → `remotion_sync.rename_project`,
+  `/duplicate-project` → `duplicate_project` — which move/copy the three project folders + rewrite the
+  snapshot.
+
+**Background job model:** the sidecar runs **one pipeline job at a time** (lock; returns 409 if busy)
+and exposes `/pipeline-status` for polling. Progress is NOT shown in the modals — it lives in the
+composition list: a module-level build store (`buildStore` in `NewProjectLauncher.tsx`) drives a
+progress bar under the project's row (`CompositionBuildBar`), or a synthetic stand-in row while the
+snapshot doesn't exist yet on a brand-new project (`SyntheticBuildRow`). A building project is blocked
+from selection (`isBuildBlocked`) so you never open a half-written composition; the store re-attaches
+to an in-flight run after a page reload (`initOnce`). Deep notes in memory
+`remotion-new-project-launcher` + `remotion-rerun-flicker-loop`.
+
+**Patched Studio files** (beyond the Subtitles/Delete patches): `CompositionSelector.js` +
+`CompositionSelectorItem.js` (mount launchers, build rows, selection block), `composition-menu-items.js`
+(re-run menu item), `RenameComposition.js` + `DuplicateComposition.js` (dialog copy), and
+`@remotion/studio-server` `apply-codemod.js` (rename/duplicate → sidecar).
 
 **Render** a project: `4_render.py --render` renders the active composition → `output/<name>.mp4` (override stem with `--output-name`). Standalone: `node render.mjs <composition-id>`.
 
@@ -162,8 +223,8 @@ Two independent caption flows:
 A literal **Subtitles** tab in the Remotion Studio right sidebar (order: Subtitles · Props · Renders),
 showing the selected composition's transcript. Remotion has **no public API** for custom Studio tabs
 (`registerStudioPanel` = GitHub remotion-dev/remotion#7200, unshipped) — this is a deliberate
-`patch-package` hack and **breaks on every Remotion version bump** (re-apply via postinstall). Full
-feature roadmap in `HANDOFF-subtitles-tab.md`; deep notes in memory `remotion-studio-custom-tab`.
+`patch-package` hack and **breaks on every Remotion version bump** (re-apply via postinstall).
+Deep notes in memory `remotion-studio-custom-tab`.
 
 **Two gotchas that cost real time — do NOT re-discover:**
 
@@ -205,12 +266,16 @@ feature roadmap in `HANDOFF-subtitles-tab.md`; deep notes in memory `remotion-st
   `onPointerDown` to the root div).
 - Verify without a browser: `curl -s localhost:3000/bundle.js | grep -c "<unique string from the component>"`.
 
-**Sidecar server (`sidecar.py`) — delete captions to cut video + persist edits:**
-The tab POSTs to a local Python HTTP server (port **9848**) because browser JS can't shell out to
-Python directly — it's a doorbell, not a worker (it spawns `4_render.py` fresh per request and idles
-between). Endpoints: `/apply-cuts` (re-runs `4_render.py --drop-cuts` / `--drop-ranges`, then returns
-the re-mapped captions so the tab resyncs its store), `/save-captions` (debounced persist of caption
-text/split/merge edits into the snapshot), `/fix`, `/project-health`.
+**Sidecar server (`sidecar.py`) — Python worker for browser-triggered actions (port 9848):**
+Browser JS can't shell out to Python, so the sandboxed Studio UI POSTs to a local Python HTTP server.
+Two kinds of work:
+- **Subtitles-tab re-cut / edits** (spawned per request, idles between — a doorbell): `/apply-cuts`
+  (re-runs `4_render.py --drop-cuts` / `--drop-ranges`, then returns the re-mapped captions so the tab
+  resyncs its store), `/save-captions` (debounced persist of caption text/split/merge edits into the
+  snapshot), `/fix`, `/project-health`.
+- **Pipeline job runner** (long-running background job, one at a time — see the Compositions tab
+  section): `/run-pipeline`, `/rerun-pipeline`, `/pipeline-status`, `/upload-video`, `/import-path`,
+  `/input-videos`, `/delete-project`, `/duplicate-project`, `/rename-project`.
 
 `npm run dev` (from `src/remotion/`) starts **both** Studio and the sidecar via `concurrently
 --kill-others` — one terminal; killing either one (Ctrl-C, or quitting Studio) takes the other down too,
@@ -270,13 +335,13 @@ Remotion is **not used** by step 6. Remotion still handles captions + Studio pre
 8. **Black-bridge transitions are opt-in per side.** `TextScene` accepts `fadeInFromBlack` / `fadeOutToBlack` (both default `true`). The opening text follows the intro logo on the same `background.png`, so it passes `fadeInFromBlack={false}` — otherwise it fades through black for no reason.
 9. **Layer/source order matters for fade-to-black.** The black bridge inside `TextScene` is the LAST child of the outer `<AbsoluteFill>` so it sits above the text. Putting it earlier in the tree means the text is drawn over the black and never disappears.
 
-### Working on this composition
+### Working on Remotion compositions (generic)
 
-- User scrubs Studio + reports issues as **timestamps** (e.g. "at 00:17.25"). Convert: `frame = round(seconds × 30)`. Map to scene by computing `INTRO_DURATION_FRAMES + BEGINNING_DURATION + …`.
+- User scrubs Studio + reports issues as **timestamps** (e.g. "at 00:17.25"). Convert: `frame = round(seconds × 30)` (30fps). Map to scene by summing the `*_FRAMES` durations before it.
 - User often hand-edits `config.ts` between turns to retune values. Re-`Read` it before recomputing anything.
 - Never hardcode timing values in scene components. Add a `*_FRAMES` constant to `config.ts` and import it.
-- Re-Read `15caro_text.png` and `background.png` if a visual decision depends on them (already in `public/caro/`).
-- Studio is started with `npm run dev` from `src/remotion/`. Background log lives in `/tmp/caro_studio.log` during a session.
+- Re-Read any image asset a visual decision depends on before deciding.
+- Studio is started with `npm run dev` from `src/remotion/`.
 
 ## Shared modules (pipeline)
 

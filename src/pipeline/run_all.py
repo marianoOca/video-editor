@@ -46,7 +46,7 @@ def derive_project_name(args, input_dir: Path):
     if args.project:
         return args.project
     if args.input:
-        return Path(args.input).stem
+        return Path(args.input[0]).stem
     if args.from_step == 1:
         vids = sorted(
             [*input_dir.glob("*.mp4"), *input_dir.glob("*.mov")],
@@ -90,8 +90,8 @@ def main():
                         help="Skip text lower-thirds in step 6")
     parser.add_argument("--no-images", action="store_true",
                         help="Skip Ken Burns image overlays in step 6")
-    parser.add_argument("--input", default=None,
-                        help="Process only this video file (passed to step 1)")
+    parser.add_argument("--input", nargs="+", default=None,
+                        help="Process only these video file(s), merged in order (passed to step 1)")
     parser.add_argument("--project", default=None,
                         help="Project name (default: edited video's filename stem)")
     parser.add_argument("--repetitions", action="store_true",
@@ -133,7 +133,7 @@ def main():
 
     normalize_extra = ["--mode", args.mode] if args.mode else []
     if args.input:
-        normalize_extra += ["--input", args.input]
+        normalize_extra += ["--input", *args.input]
 
     if args.output_name:
         render_extra += ["--output-name", args.output_name]

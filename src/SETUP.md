@@ -103,10 +103,10 @@ or check that `.claude/skills/remotion-best-practices` resolves correctly (not a
 > Steps 4–5 scaffold a *vanilla* Remotion project. This repo also ships custom Studio features that a fresh `create-video` does NOT include. When **cloning this repo** (vs bootstrapping from scratch), the setup is just `cd src/remotion && npm install` — `postinstall` applies them automatically.
 
 Two `patch-package` patches live in `src/remotion/patches/` and apply on every `npm install`:
-- `@remotion+studio+<ver>.patch` — adds the **Subtitles tab** to Studio's sidebar and rewords the **Delete project** dialog (frontend bundle).
-- `@remotion+studio-server+<ver>.patch` — makes Studio's native **Delete** wipe the whole project, not just edit source.
+- `@remotion+studio+<ver>.patch` (frontend bundle) — adds the **Subtitles tab** to the right sidebar, and turns the left **Compositions** panel into a project manager: **+ New project** and **Re-run pipeline** launchers, in-list build progress rows, plus native **Rename / Duplicate / Delete** dialog copy.
+- `@remotion+studio-server+<ver>.patch` — routes Studio's native **Delete / Rename / Duplicate** to the sidecar (wipe / move / copy the whole project) instead of editing Root.tsx source.
 
-Run Studio with **`npm run dev`** (from `src/remotion/`) — it starts Studio **and** the Python **sidecar** (port 9848) together via `concurrently`. The sidecar powers the Subtitles tab's Apply/Fix and the Delete button; `npm run dev:studio` runs Studio alone (those features degrade gracefully). On a Remotion version bump the patches must be re-applied (mechanical) — see `CLAUDE.md` and memory `remotion-studio-custom-tab` / `remotion-native-delete-internals`.
+Run Studio with **`npm run dev`** (from `src/remotion/`) — it starts Studio **and** the Python **sidecar** (port 9848) together via `concurrently`. The sidecar powers the Subtitles tab's Apply/Fix, the New project / Re-run pipeline background jobs, and the Delete/Rename/Duplicate buttons; `npm run dev:studio` runs Studio alone (those features degrade gracefully). On a Remotion version bump the patches must be re-applied (mechanical) — see `CLAUDE.md` and memory `remotion-studio-custom-tab` / `remotion-native-delete-internals` / `remotion-new-project-launcher`.
 
 ---
 
