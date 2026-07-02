@@ -35,29 +35,17 @@ Usage:
 
 import json
 import argparse
+import os
 import sys
 from pathlib import Path
 from config import OUT_DIR, get_duration, call_claude, silencedetect
-
-# for YouTube MAX_KEEP_GAP = 0.3 & KEEP_PAD = 0.3,  and we use microphone, better error tolerance for youtube videos with no mic or longer silences and more tone variance
-# for reels MAX_KEEP_GAP = 0.2 & KEEP_PAD = 1, this should make the videos quicker, sanppier, but more prone to errors but handable if video short
-MAX_KEEP_GAP = 0.3    # seconds — no-talk spans longer than this are cut, consider final removed gaps will be > MAX_KEEP_GAP + 2 * KEEP_PAD
-KEEP_PAD = 0.3       # seconds — headroom when no silence boundary to snap to
-MIN_SEGMENT = 0.2     # seconds — keep fragments shorter than this are dropped
-NONSPEECH_PAD = 0.05  # seconds — outward pad on whisper-labeled non-speech cuts
-
-# Edge-snapping: word DTW starts can land late (clipping a word's onset) and
-# capped word ends overshoot into trailing noise. We snap each keep block's
-# edges to the real silence→speech / speech→silence boundaries instead.
-SILENCE_DB = -35      # dB — energy below this counts as silence
-SILENCE_MIN = 0.15    # seconds — min silence to register (fine, to sit between taps)
-SNAP_LEAD = 0.6       # seconds — how far before a word's start a silence edge may be
-                      # and still count as that word's onset (covers DTW lateness)
-SNAP_SLOP = 0.15      # seconds — silence edge may sit slightly past the word start too
-SNAP_MIN = 0.05       # seconds — a closing silence must begin at least this far in
-
-REPETITION_CHUNK_SEC = 180     # seconds of speech per Claude request when transcript is long
-REPETITION_CHUNK_OVERLAP = 10  # seconds of overlap between consecutive chunks
+from tuning import (
+    MAX_KEEP_GAP, KEEP_PAD, MIN_SEGMENT, NONSPEECH_PAD, SILENT_WORD_MARGIN,
+    ENERGY_NET_MIN_BURST, ENERGY_NET_MAX_GAP, ENERGY_NET_LONG_BURST,
+    ENERGY_NET_LONG_GAP, ENERGY_NET_MAX_BURST,
+    SILENCE_DB, SILENCE_MIN, SNAP_LEAD, SNAP_SLOP, SNAP_MIN,
+    REPETITION_CHUNK_SEC, REPETITION_CHUNK_OVERLAP,
+)
 
 
 def flatten_words(transcript: dict) -> list[dict]:
@@ -92,13 +80,18 @@ def drop_silent_words(words: list[dict],
     phantom from seeding a dead-air keep block; a real-onset word never lands
     fully inside a silence, so this only removes mislabels, never spoken audio.
 
+    The start must sit SILENT_WORD_MARGIN inside the silence: a word starting a
+    few ms past the silence edge is a float tie on audio that really sits at the
+    boundary (and is kept) — dropping it would only lose its caption.
+
     Returns (kept, dropped).
     """
     if not silences:
         return words, []
     kept, dropped = [], []
     for w in words:
-        in_silence = any(s["start"] <= w["start"] and w["end"] <= s["end"]
+        in_silence = any(s["start"] + SILENT_WORD_MARGIN <= w["start"]
+                         and w["end"] <= s["end"]
                          for s in silences)
         (dropped if in_silence else kept).append(w)
     return kept, dropped
@@ -125,14 +118,24 @@ def build_keep_blocks(words: list[dict], silences: list[dict],
     if not words:
         return []
 
-    # Word-coverage blocks; track first and last word starts for snapping.
-    raw = [{"first": words[0]["start"], "last": words[0]["start"], "end": words[0]["end"]}]
+    # Word-coverage blocks; track first and last word starts for snapping, plus
+    # the block's latest "evidence" instant (last sub-token DTW onset, written by
+    # step 2) — audio is PROVEN to still be running there, so the end snap must
+    # not pick a silence before it (that would cut an evidence-extended word
+    # right back to its first token).
+    def _ev(w):
+        return max(w["start"], w.get("evidence", w["start"]))
+
+    raw = [{"first": words[0]["start"], "last": words[0]["start"],
+            "evid": _ev(words[0]), "end": words[0]["end"]}]
     for w in words[1:]:
         if w["start"] - raw[-1]["end"] <= MAX_KEEP_GAP:
             raw[-1]["end"] = max(raw[-1]["end"], w["end"])
             raw[-1]["last"] = w["start"]
+            raw[-1]["evid"] = max(raw[-1]["evid"], _ev(w))
         else:
-            raw.append({"first": w["start"], "last": w["start"], "end": w["end"]})
+            raw.append({"first": w["start"], "last": w["start"],
+                        "evid": _ev(w), "end": w["end"]})
 
     blocks = []
     for b in raw:
@@ -142,11 +145,13 @@ def build_keep_blocks(words: list[dict], silences: list[dict],
                 if b["first"] - SNAP_LEAD <= s["end"] <= b["first"] + SNAP_SLOP]
         start = max(lead) if lead else b["first"] - KEEP_PAD
 
-        # END: earliest silence that begins after the last word's onset — its
-        # start is the real speech offset. Only trust it when it lands near the
-        # word's (capped) end; otherwise the word was too quiet for silencedetect
-        # to bound and the next silence is far away, so fall back to a plain pad.
-        trail = [s["start"] for s in silences if s["start"] >= b["last"] + SNAP_MIN]
+        # END: earliest silence that begins after the last word's onset (or the
+        # block's latest evidence instant, if later) — its start is the real
+        # speech offset. Only trust it when it lands near the word's (capped)
+        # end; otherwise the word was too quiet for silencedetect to bound and
+        # the next silence is far away, so fall back to a plain pad.
+        floor = max(b["last"], b["evid"])
+        trail = [s["start"] for s in silences if s["start"] >= floor + SNAP_MIN]
         fallback_end = b["end"] + KEEP_PAD
         end = min(trail) if trail else fallback_end
         if end > fallback_end + SNAP_LEAD:
@@ -167,6 +172,98 @@ def build_keep_blocks(words: list[dict], silences: list[dict],
         else:
             merged.append(b)
     return merged
+
+
+def extend_keeps_to_adjacent_speech(keep: list[dict], silences: list[dict],
+                                    total_duration: float) -> tuple[list[dict], int]:
+    """Energy safety net: rescue real speech the transcript mistimed.
+
+    Keep = word coverage, so wherever whisper's word timing is wrong the real
+    audio has no coverage and is cut by construction. A speech-energy burst
+    (complement of silencedetect) of at least ENERGY_NET_MIN_BURST that survived
+    outside every keep, but sits within ENERGY_NET_MAX_GAP of a keep edge, is
+    almost always that mistimed speech — a late DTW onset or a capped word end.
+    The nearest keep is extended to cover the burst.
+
+    Three bounds protect the word-first design (each covers a verified failure):
+    keeps are only ever EXTENDED, never created (isolated noise stays cut); a
+    rescue is capped at ENERGY_NET_MAX_BURST (sustained audio fused to a speech
+    edge — music, typing, a second voice — is not a mistimed word); and a burst
+    spanning keep-edge to keep-edge is skipped (that is a pause silencedetect
+    missed — re-gluing it would undo a word-gap cut, and with no detected
+    silences at all it would undo EVERY cut).
+
+    Returns (new_keep, bursts_rescued).
+    """
+    if not keep:
+        return keep, 0
+
+    # Speech = complement of the silence intervals.
+    speech = []
+    cursor = 0.0
+    for s in silences:
+        if s["start"] - cursor > 1e-6:
+            speech.append((cursor, s["start"]))
+        cursor = max(cursor, s["end"])
+    if total_duration - cursor > 1e-6:
+        speech.append((cursor, total_duration))
+
+    blocks = [dict(b) for b in keep]
+    rescued = 0
+    for a, b in speech:
+        # Subtract keeps from this speech interval → uncovered bursts.
+        pieces = [(a, b)]
+        for k in keep:
+            nxt = []
+            for pa, pb in pieces:
+                if k["end"] <= pa or k["start"] >= pb:
+                    nxt.append((pa, pb))
+                    continue
+                if k["start"] > pa:
+                    nxt.append((pa, k["start"]))
+                if k["end"] < pb:
+                    nxt.append((k["end"], pb))
+            pieces = nxt
+        for pa, pb in pieces:
+            if not ENERGY_NET_MIN_BURST <= pb - pa <= ENERGY_NET_MAX_BURST:
+                continue
+            # A burst whose bounds are keep edges on BOTH sides is the whole gap
+            # between two keeps — a pause silencedetect missed, not mistimed
+            # speech (a real rescue is silence-bounded on at least one side).
+            # Re-gluing it would undo a word-gap cut, so skip it.
+            starts_at_keep = any(abs(k["end"] - pa) < 1e-9 for k in keep)
+            ends_at_keep = any(abs(k["start"] - pb) < 1e-9 for k in keep)
+            if starts_at_keep and ends_at_keep:
+                continue
+            # Nearest keep edge (0 gap when the burst touches a block). Measured
+            # against the ORIGINAL keeps: measuring against already-extended
+            # blocks lets rhythmic noise (typing, footsteps) chain-rescue its way
+            # arbitrarily far from the real speech edge.
+            def gap_to(k):
+                if pa >= k["end"]:
+                    return pa - k["end"]
+                if k["start"] >= pb:
+                    return k["start"] - pb
+                return 0.0
+            idx = min(range(len(keep)), key=lambda i: gap_to(keep[i]))
+            max_gap = (ENERGY_NET_LONG_GAP if pb - pa >= ENERGY_NET_LONG_BURST
+                       else ENERGY_NET_MAX_GAP)
+            if gap_to(keep[idx]) > max_gap:
+                continue
+            rescued += 1
+            blocks[idx]["start"] = min(blocks[idx]["start"], pa)
+            blocks[idx]["end"] = max(blocks[idx]["end"], pb)
+
+    if not rescued:
+        return keep, 0
+    blocks.sort(key=lambda b: b["start"])
+    merged = [blocks[0]]
+    for b in blocks[1:]:
+        if b["start"] <= merged[-1]["end"]:
+            merged[-1]["end"] = max(merged[-1]["end"], b["end"])
+        else:
+            merged.append(b)
+    return merged, rescued
 
 
 def cut_silence_gaps(keep: list[dict], silences: list[dict],
@@ -358,6 +455,13 @@ def main():
     print(f"  Keep blocks (word coverage, edges snapped to silence): "
           f"{len(keep)} ({_sum_duration(keep):.1f}s)")
 
+    # Energy safety net: rescue real speech whisper mistimed (late DTW onset,
+    # capped word end) — uncovered speech bursts adjacent to a keep edge.
+    keep, rescued = extend_keeps_to_adjacent_speech(keep, silences, total_duration)
+    if rescued:
+        print(f"  energy net: rescued {rescued} uncovered speech burst(s) "
+              f"→ {len(keep)} blocks ({_sum_duration(keep):.1f}s)")
+
     # Cut real silence that words bridged into a block. whisper.cpp has no
     # reliable word end, so a pause shorter than MAX_WORD_DUR of start-to-start
     # spacing is hidden from the word-gap splitter and survives as in-block dead
@@ -403,8 +507,10 @@ def main():
     }
 
     out_path = OUT_DIR / "edit_plan.json"
-    with open(out_path, "w", encoding="utf-8") as f:
+    tmp = out_path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(edit_plan, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, out_path)  # atomic — repo convention (see remotion_sync)
 
     print(f"\n✅ Done.")
     print(f"   edit_plan.json → {out_path}")

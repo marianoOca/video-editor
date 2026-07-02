@@ -112,3 +112,24 @@ index ec82965..7dc142c 100644
          const time = Date.now();
          const filePath = symbolicatedStack
              ? (0, apply_codemod_to_file_1.resolveFilePathFromSymbolicatedStack)(remotionRoot, symbolicatedStack)
+diff --git a/node_modules/@remotion/studio-server/dist/preview-server/routes/open-in-file-explorer.js b/node_modules/@remotion/studio-server/dist/preview-server/routes/open-in-file-explorer.js
+index a41abc3..3952f15 100644
+--- a/node_modules/@remotion/studio-server/dist/preview-server/routes/open-in-file-explorer.js
++++ b/node_modules/@remotion/studio-server/dist/preview-server/routes/open-in-file-explorer.js
+@@ -1,8 +1,15 @@
+ "use strict";
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.handleOpenInFileExplorer = void 0;
++const node_path_1 = require("node:path");
+ const open_directory_in_finder_1 = require("../../open-directory-in-finder");
+ const handleOpenInFileExplorer = ({ input: { directory }, remotionRoot }) => {
+-    return (0, open_directory_in_finder_1.openDirectoryInFinder)(directory, remotionRoot);
++    // video-editor patch: renders are written to <repo>/output, two levels above
++    // remotionRoot (= src/remotion), so they sit outside remotionRoot and the default
++    // guard rejects them ("Not allowed to open ../../output/..."). Widen the allowed
++    // root to the repo root so the render tab's "reveal in Finder" button works, while
++    // still bounding opens to inside the project.
++    const allowedRoot = node_path_1.resolve(remotionRoot, "..", "..");
++    return (0, open_directory_in_finder_1.openDirectoryInFinder)(directory, allowedRoot);
+ };
+ exports.handleOpenInFileExplorer = handleOpenInFileExplorer;

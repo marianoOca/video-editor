@@ -76,8 +76,11 @@ def write_project_snapshot(
     pub = public_project_dir(name, remotion_dir)
     pub.mkdir(parents=True, exist_ok=True)
 
-    # Video
-    shutil.copy2(edited_mp4, pub / "edited.mp4")
+    # Video — via temp + os.replace: Studio streams this exact path, and an
+    # in-place copy lets it read a half-written file mid-publish (torn frames).
+    tmp = pub / "edited.mp4.tmp"
+    shutil.copy2(edited_mp4, tmp)
+    os.replace(tmp, pub / "edited.mp4")
 
     # Images — clear stale ones first so a previous render's overlays can't leak in.
     images_dest = pub / "images"

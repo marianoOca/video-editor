@@ -9,6 +9,7 @@ Usage:
 
 import subprocess
 import json
+import os
 import socket
 import sys
 import time
@@ -19,8 +20,9 @@ from config import (
     VIDEO_FPS, FFMPEG_AAC_STEREO_ARGS, SIDECAR_PORT, get_mode, run_ffmpeg,
     seconds_to_frame, frames_to_ms,
 )
-from captions_config import (
+from tuning import (
     MAX_WORDS_PER_CAPTION, MAX_CHARS_PER_CAPTION, MIN_CAPTION_DURATION_MS,
+    MIN_WORD_OVERLAP,
 )
 from remotion_sync import write_project_snapshot, regenerate_root, read_snapshot
 
@@ -110,29 +112,39 @@ def build_subtitles(transcript: dict, keep: list[dict]) -> list[dict]:
     Map transcript words to the edited timeline, then group into short caption
     lines (≤ MAX_WORDS_PER_CAPTION words, ≤ MAX_CHARS_PER_CAPTION chars).
 
-    Words that span or fall inside a cut are discarded — no phantom fallback.
+    Words fully inside a cut are discarded — no phantom fallback.
     Groups never cross keep-segment boundaries (no text from cut zone bleeds in).
     Returns list of {start (frame), end (frame), text}.
     """
+    # Overlap rule + MIN_WORD_OVERLAP documented in tuning.py. Zero-duration
+    # words (collapsed DTW starts) carry no overlap, so they fall back to the
+    # start-inside test.
     def word_to_edited(word: dict):
         """Map a word's [start, end] to the edited timeline.
         Returns (edited_start, edited_end, keep_idx) or None if the word is cut.
-        Words whose start falls in a segment are accepted; end is clamped to the
-        segment boundary so that WhisperX over-long word timestamps don't drop words."""
+        Both edges are clamped to the segment."""
+        duration = word["end"] - word["start"]
+        best = None  # (overlap, edited_start, edited_end, keep_idx)
         edited_cursor = 0.0
         for idx, seg in enumerate(keep):
-            if word["start"] >= seg["start"] and word["start"] < seg["end"]:
-                offset = edited_cursor
-                clamped_end = min(word["end"], seg["end"])
-                return (
-                    offset + (word["start"] - seg["start"]),
-                    offset + (clamped_end - seg["start"]),
-                    idx,
-                )
-            if word["start"] < seg["start"]:
-                return None  # word is before this segment and wasn't in a previous one
+            if duration <= 0:
+                if seg["start"] <= word["start"] < seg["end"]:
+                    off = edited_cursor + (word["start"] - seg["start"])
+                    return (off, off, idx)
+            else:
+                ov_start = max(word["start"], seg["start"])
+                ov_end = min(word["end"], seg["end"])
+                overlap = ov_end - ov_start
+                if (overlap >= min(MIN_WORD_OVERLAP, duration / 2)
+                        and (best is None or overlap > best[0])):
+                    best = (
+                        overlap,
+                        edited_cursor + (ov_start - seg["start"]),
+                        edited_cursor + (ov_end - seg["start"]),
+                        idx,
+                    )
             edited_cursor += seg["end"] - seg["start"]
-        return None
+        return best[1:] if best else None
 
     # Collect all words mapped to the edited timeline
     mapped_words = []
@@ -428,37 +440,52 @@ def captions_match_keep(prev_caps: list[dict], old_keep: list[dict]) -> bool:
 
 
 def remap_captions(prev_caps: list[dict], old_keep: list[dict],
-                   new_keep: list[dict], cut_indices: set[int],
-                   ranges_ms: list[tuple[float, float]]) -> list[dict]:
+                   new_keep: list[dict]) -> list[dict]:
     """Re-time persisted (edited) captions through a re-cut, preserving manual
     text/split/merge edits instead of re-deriving them from the transcript.
 
-    Every deletion (a dropped cut or a dropped line) aligns to whole captions, so
-    each surviving caption is fully outside the removed edited-time intervals —
-    re-timing is a pure left-shift by the dropped time before it. cutIndex is
-    recomputed against the new keep segmentation (auto-renumbers; a mid-cut line
-    delete that splits a segment is reflected). Times are EDITED-time ms."""
-    # Old-edited offsets (seconds) per keep segment → removed intervals R (ms).
-    old_off, cur = [], 0.0
-    for seg in old_keep:
-        old_off.append(cur)
-        cur += seg["end"] - seg["start"]
+    The removed time is derived from the ACTUAL keep diff (old coverage minus
+    new coverage, mapped to old-edited ms) rather than from the requested
+    deletions: carved ranges, whole-cut drops AND the word-less pad slivers that
+    drop_wordless_segments removes all count. Deriving it from the request
+    instead misses the slivers, leaving every later caption late by the pad
+    (~0.1-0.3s per deletion). A diff also yields disjoint intervals, so an
+    overlapping cut+range pair can't double-shift. Every deletion aligns to
+    whole captions, so each surviving caption is fully outside the removed
+    intervals — re-timing is a pure left-shift by the dropped time before it.
+    cutIndex is recomputed against the new keep segmentation. EDITED-time ms."""
+    # removed (old-edited ms) = old_keep coverage minus new_keep coverage.
     removed: list[tuple[float, float]] = []
-    for c in cut_indices:
-        if 0 <= c < len(old_keep):
-            removed.append((old_off[c] * 1000.0,
-                            (old_off[c] + (old_keep[c]["end"] - old_keep[c]["start"])) * 1000.0))
-    removed.extend((float(s), float(e)) for s, e in ranges_ms)
+    cur = 0.0
+    for seg in old_keep:
+        pieces = [(seg["start"], seg["end"])]
+        for k in new_keep:
+            nxt = []
+            for ps, pe in pieces:
+                if k["end"] <= ps or k["start"] >= pe:
+                    nxt.append((ps, pe))
+                    continue
+                if k["start"] > ps:
+                    nxt.append((ps, k["start"]))
+                if k["end"] < pe:
+                    nxt.append((k["end"], pe))
+            pieces = nxt
+        removed.extend(((cur + ps - seg["start"]) * 1000.0,
+                        (cur + pe - seg["start"]) * 1000.0)
+                       for ps, pe in pieces if pe - ps > 1e-9)
+        cur += seg["end"] - seg["start"]
     removed.sort()
 
     def removed_before(t: float) -> float:
         return sum(max(0.0, min(t, b) - a) for a, b in removed)
 
     def overlaps_removed(s: float, e: float) -> bool:
-        # Any overlap with a dropped interval → the caption is gone. Aligned drops
-        # make this all-or-nothing; the overlap form also stays correct if a manual
-        # time-edit left a caption straddling a boundary (it's dropped, not mis-shifted).
-        return any(not (e <= a or s >= b) for a, b in removed)
+        # Any real overlap with a dropped interval → the caption is gone. Aligned
+        # drops make this all-or-nothing; the overlap form also stays correct if a
+        # manual time-edit left a caption straddling a boundary (it's dropped, not
+        # mis-shifted). Half-ms slack: removed bounds are float keep sums while
+        # caption times sit on the frame grid — an exact touch must not count.
+        return any(e > a + 0.5 and s < b - 0.5 for a, b in removed)
 
     # New-edited bounds (ms) per keep segment, for cutIndex recomputation. Rounded to
     # whole ms: the boundaries are a running sum of float durations, so a clean 1100 ms
@@ -560,8 +587,10 @@ def main():
             sys.exit(1)
         plan["keep"] = new_keep
         plan["final_duration"] = sum(k["end"] - k["start"] for k in new_keep)
-        with open(edit_plan_path, "w", encoding="utf-8") as f:
+        tmp = edit_plan_path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(plan, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, edit_plan_path)  # atomic — repo convention
         print(f"  removed {len(cut_indices)} cut(s) + {len(ranges_ms)} line(s); "
               f"{len(new_keep)} segment(s) remain")
 
@@ -575,7 +604,7 @@ def main():
         prev = read_snapshot(ACTIVE_PROJECT)
         prev_caps = (prev or {}).get("captions")
         if prev_caps and captions_match_keep(prev_caps, old_keep):
-            captions = remap_captions(prev_caps, old_keep, new_keep, cut_indices, ranges_ms)
+            captions = remap_captions(prev_caps, old_keep, new_keep)
             print(f"  re-mapped {len(captions)} caption(s) through the cut (edits preserved)")
         elif prev_caps:
             print("  ⚠ snapshot captions inconsistent with the cut (stale Studio store?) — "

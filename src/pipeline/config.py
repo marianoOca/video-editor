@@ -34,16 +34,26 @@ def sanitize_project_name(stem: str) -> str:
     return s or "default"
 
 
+VIDEO_EXTS = (".mp4", ".mov")
+
+
+def list_videos(directory: Path) -> list[Path]:
+    """Video files in `directory`, extension-matched case-insensitively (iPhone
+    files arrive as .MOV/.MP4; a POSIX glob would miss them), sorted by
+    lowercased name so "first video" means the same file everywhere it matters:
+    project naming, merge order, and mode detection."""
+    if not directory.exists():
+        return []
+    return sorted((p for p in directory.iterdir()
+                   if p.is_file() and p.suffix.lower() in VIDEO_EXTS),
+                  key=lambda p: p.name.lower())
+
+
 def first_input_video_stem() -> Optional[str]:
-    """First-alphabetical stem of input/*.{mp4,mov}. This is the historical
+    """First-alphabetical stem of the input/ videos. This is the historical
     default project: the pipeline merges all input videos and names the project
     after the first one. Returns None if input/ has no videos."""
-    if not INPUT_DIR.exists():
-        return None
-    vids = sorted(
-        [*INPUT_DIR.glob("*.mp4"), *INPUT_DIR.glob("*.mov")],
-        key=lambda p: p.name.lower(),
-    )
+    vids = list_videos(INPUT_DIR)
     return vids[0].stem if vids else None
 
 
@@ -83,6 +93,9 @@ VIDEO_H_PX = REEL_H
 # --- ffmpeg encoding fragments ---
 FFMPEG_X264_FAST_ARGS = ["-c:v", "libx264", "-preset", "fast", "-crf", "18"]
 FFMPEG_AAC_STEREO_ARGS = ["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"]
+
+# whisper.cpp accepts ONLY 16 kHz mono WAV — a format requirement, not a knob.
+WHISPER_SAMPLE_RATE = 16000
 
 # --- Image overlays ---
 IMAGES_DIR = INPUT_DIR / "images"
@@ -158,14 +171,22 @@ def silencedetect(path: Path, noise_db: float, min_dur: float,
     the file ends mid-silence ffmpeg emits a trailing silence_start with no matching
     silence_end; when total_duration is given that unpaired start is closed at
     total_duration instead of being silently dropped by zip()."""
+    # Band-pass to the human-voice range (~80-3000 Hz) BEFORE measuring loudness, so
+    # low rumble (AC/fridge/mic handling) and high hiss don't keep a real pause above
+    # the noise threshold and get mistaken for speech. Detection-only: the actual
+    # audio/video is untouched, this filter just sharpens the pause-vs-speech call.
     proc = run_ffmpeg(
         ["ffmpeg", "-i", str(path),
-         "-af", f"silencedetect=noise={noise_db}dB:d={min_dur}",
+         "-af", f"highpass=f=80,lowpass=f=3000,silencedetect=noise={noise_db}dB:d={min_dur}",
          "-f", "null", "-"]
     )
     out = proc.stderr or ""
-    starts = [float(m) for m in re.findall(r"silence_start: ([\d.]+)", out)]
-    ends = [float(m) for m in re.findall(r"silence_end: ([\d.]+)", out)]
+    # ffmpeg emits negative starts at the stream head ("silence_start: -0.00232")
+    # and can use exponent notation for tiny values. A pattern that misses one
+    # start shifts the zip pairing and corrupts EVERY interval after it.
+    num = r"(-?[\d.]+(?:[eE][+-]?\d+)?)"
+    starts = [max(0.0, float(m)) for m in re.findall(rf"silence_start: {num}", out)]
+    ends = [max(0.0, float(m)) for m in re.findall(rf"silence_end: {num}", out)]
     pairs = list(zip(starts, ends))
     if len(starts) > len(ends) and total_duration is not None:
         pairs.append((starts[len(ends)], total_duration))

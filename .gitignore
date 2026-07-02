@@ -21,7 +21,7 @@ src/remotion/node_modules/
 
 # Claude Code worktrees (transient, not project content)
 .claude/worktrees/
-HANDOFF-*.md
+HANDOFF*.md
 
 # Whisper.cpp install + models (downloaded by 2_transcribe.py)
 whisper.cpp/
@@ -32,3 +32,5 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+
+editor-pro-max/

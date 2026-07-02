@@ -64,6 +64,26 @@ def check_server():
 # Claude: decide lower-thirds from transcript
 # ---------------------------------------------------------------------------
 
+def edited_segments(plan: dict) -> list[dict]:
+    """Kept speech as EDITED-timeline segments [{start, end, text}] — one per
+    keep block, text = the transcript words whose midpoint the block covers.
+    Lower-thirds are placed on the edited video, so the timestamps Claude sees
+    must be edited-time; the plan's transcript segments are SOURCE-time (and the
+    plan has no top-level 'segments' key — reading it as one crashed this step
+    on every reel run with lower-thirds enabled)."""
+    words = [w for seg in plan.get("transcript", {}).get("segments", [])
+             for w in (seg.get("words") or []) if "start" in w and "end" in w]
+    out, cur = [], 0.0
+    for k in plan.get("keep", []):
+        dur = k["end"] - k["start"]
+        text = " ".join(w["word"].strip() for w in words
+                        if k["start"] <= (w["start"] + w["end"]) / 2 < k["end"])
+        if text:
+            out.append({"start": cur, "end": cur + dur, "text": text})
+        cur += dur
+    return out
+
+
 def ask_claude_lower_thirds(edit_plan: list[dict]) -> list[dict]:
     """Ask Claude which segments deserve a text lower-third and what to say."""
     print("  asking Claude for lower-third suggestions...")
@@ -339,9 +359,7 @@ def main():
     edit_plan: list[dict] = []
     if edit_plan_path.exists() and include_lower_thirds:
         with open(edit_plan_path, encoding="utf-8") as f:
-            raw = json.load(f)
-            # edit_plan.json is {"segments": [...]}
-            edit_plan = raw.get("segments", raw) if isinstance(raw, dict) else raw
+            edit_plan = edited_segments(json.load(f))
 
     has_images = bool(image_plan) and include_images
     has_lower_thirds_source = bool(edit_plan) and include_lower_thirds

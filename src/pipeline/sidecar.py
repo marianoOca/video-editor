@@ -62,6 +62,7 @@ from urllib.parse import parse_qs, urlparse
 os.environ.setdefault("VE_ALLOW_NO_PROJECT", "1")
 from config import (  # noqa: E402
     SIDECAR_PORT, INPUT_DIR, HYPERFRAMES_PORT, sanitize_project_name,
+    VIDEO_EXTS, list_videos,
 )
 from remotion_sync import (  # noqa: E402
     update_snapshot, read_snapshot, delete_project, duplicate_project,
@@ -71,7 +72,6 @@ from remotion_sync import (  # noqa: E402
 PIPELINE_DIR = Path(__file__).parent
 PROJECT_RE = re.compile(r"^[A-Za-z0-9-]+$")
 
-VIDEO_EXTS = (".mp4", ".mov")
 MAX_UPLOAD_BYTES = 50 * 1024 ** 3  # 50 GB sanity cap (multi-GB videos exist)
 
 # --- Background pipeline job ---
@@ -83,6 +83,11 @@ MAX_UPLOAD_BYTES = 50 * 1024 ** 3  # 50 GB sanity cap (multi-GB videos exist)
 # which also serializes all writers against the same src/data/<name>/.
 _JOB_LOCK = threading.Lock()
 _JOB: dict | None = None
+# Project a synchronous /apply-cuts is currently re-cutting. Re-cuts run inside
+# the request (not as a job), so without this marker they would be invisible to
+# the busy checks — a delete/rename or a second re-cut could then write the same
+# project concurrently.
+_SYNC_BUSY: str | None = None
 _TOTAL_STEPS = 6
 # run_all.py prints "▶  <script>" at each step boundary (see its run_step()).
 _STEP_LABELS = {
@@ -104,17 +109,44 @@ def _port_open(port: int, host: str = "127.0.0.1", timeout: float = 0.2) -> bool
         return False
 
 
-def _pipeline_busy() -> bool:
+def _busy_project() -> str | None:
+    """Project currently being written — by the background job or by a
+    synchronous /apply-cuts re-cut — else None. Mutating endpoints refuse only
+    when their TARGET matches this (deleting project B while A builds is fine);
+    heavy pipeline ops stay globally single-slot via _pipeline_busy()."""
     with _JOB_LOCK:
-        return _JOB is not None and _JOB["state"] == "running"
+        if _SYNC_BUSY is not None:
+            return _SYNC_BUSY
+        if _JOB is not None and _JOB["state"] == "running":
+            return _JOB["project"]
+    return None
+
+
+def _pipeline_busy() -> bool:
+    return _busy_project() is not None
+
+
+def _claim_sync(project: str) -> bool:
+    """Atomically claim the single work slot for a synchronous re-cut. False if
+    a job or another re-cut is already running (caller answers 409)."""
+    global _SYNC_BUSY
+    with _JOB_LOCK:
+        if _SYNC_BUSY is not None or (_JOB is not None and _JOB["state"] == "running"):
+            return False
+        _SYNC_BUSY = project
+        return True
+
+
+def _release_sync() -> None:
+    global _SYNC_BUSY
+    with _JOB_LOCK:
+        _SYNC_BUSY = None
 
 
 def _has_input_videos() -> bool:
     """True if input/ holds at least one .mp4/.mov. Gates re-running step 1, which
     re-normalizes from input/ — pointless (and a hard error) with nothing there."""
-    return INPUT_DIR.exists() and any(
-        True for ext in VIDEO_EXTS for _ in INPUT_DIR.glob(f"*{ext}")
-    )
+    return bool(list_videos(INPUT_DIR))
 
 
 def _job_snapshot() -> dict | None:
@@ -160,7 +192,7 @@ def _start_job(cmd: list[str], project: str) -> dict | None:
     dict, or None if one is already running (caller answers 409)."""
     global _JOB
     with _JOB_LOCK:
-        if _JOB is not None and _JOB["state"] == "running":
+        if _SYNC_BUSY is not None or (_JOB is not None and _JOB["state"] == "running"):
             return None
         job = {
             "id": uuid.uuid4().hex[:12],
@@ -181,10 +213,12 @@ def _start_job(cmd: list[str], project: str) -> dict | None:
     # Inherited by the child step subprocesses too, so their output streams as well.
     env = {**os.environ, "VE_PROJECT": project, "PYTHONUNBUFFERED": "1"}
     print(f"[sidecar] start job {job['id']} ({project}): {' '.join(cmd)}")
+    # errors="replace": one undecodable byte in ffmpeg/whisper output would
+    # otherwise kill _job_reader mid-stream and leave the job "running" forever.
     proc = subprocess.Popen(
         cmd, cwd=PIPELINE_DIR, env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1,
+        text=True, errors="replace", bufsize=1,
     )
     threading.Thread(target=_job_reader, args=(proc, job), daemon=True).start()
     return job
@@ -333,26 +367,31 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"ok": False, "error": str(e)})
             return
 
-        if _pipeline_busy():
+        # Hold the single work slot for the whole synchronous re-cut so a second
+        # Apply, a pipeline job, or a same-project delete/rename can't run
+        # concurrently against the files being rewritten.
+        if not _claim_sync(project):
             self._json(409, {"ok": False, "error": "a pipeline run is already active"})
             return
+        try:
+            # Persist the tab's current (edited) captions before re-cutting so
+            # 4_render re-maps THEM through the cut — preserving manual edits/splits.
+            self._persist_captions(project, data.get("captions"))
 
-        # Persist the tab's current (edited) captions before re-cutting so
-        # 4_render re-maps THEM through the cut — preserving manual edits/splits.
-        self._persist_captions(project, data.get("captions"))
-
-        cmd = [sys.executable, "4_render.py"]
-        if drop:
-            cmd += ["--drop-cuts", ",".join(str(i) for i in drop)]
-        if ranges:
-            cmd += ["--drop-ranges", ",".join(f"{s:.0f}-{e:.0f}" for s, e in ranges)]
-        # Return the re-mapped captions so the tab can resync its Studio store to
-        # the new (shorter) timeline — otherwise the pre-cut caption override
-        # survives HMR and shadows the snapshot, desyncing captions from the video.
-        self._run_and_respond(
-            cmd, project,
-            extra_on_success=lambda: {"captions": (read_snapshot(project) or {}).get("captions", [])},
-        )
+            cmd = [sys.executable, "4_render.py"]
+            if drop:
+                cmd += ["--drop-cuts", ",".join(str(i) for i in drop)]
+            if ranges:
+                cmd += ["--drop-ranges", ",".join(f"{s:.0f}-{e:.0f}" for s, e in ranges)]
+            # Return the re-mapped captions so the tab can resync its Studio store to
+            # the new (shorter) timeline — otherwise the pre-cut caption override
+            # survives HMR and shadows the snapshot, desyncing captions from the video.
+            self._run_and_respond(
+                cmd, project,
+                extra_on_success=lambda: {"captions": (read_snapshot(project) or {}).get("captions", [])},
+            )
+        finally:
+            _release_sync()
 
     def _save_captions(self) -> None:
         """Persist edited captions to the snapshot (debounced auto-save from the
@@ -366,6 +405,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("captions must be a list")
         except (ValueError, TypeError, json.JSONDecodeError) as e:
             self._json(400, {"ok": False, "error": str(e)})
+            return
+        if _busy_project() == project:
+            self._json(409, {"ok": False,
+                             "error": "project has a run in progress; save skipped"})
             return
         fields = {"captions": captions}
         if "captionsEnabled" in data:
@@ -422,6 +465,11 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, json.JSONDecodeError) as e:
             self._json(400, {"ok": False, "error": str(e)})
             return
+        # Only refuse when THIS project is being written (a job or a re-cut);
+        # deleting a different project during a run is safe and allowed.
+        if _busy_project() == project:
+            self._json(409, {"ok": False, "error": "project has a run in progress"})
+            return
         try:
             removed = delete_project(project)
         except Exception as e:  # never crash the caller
@@ -439,6 +487,9 @@ class Handler(BaseHTTPRequestHandler):
             src, dst = self._read_from_to()
         except (ValueError, TypeError, json.JSONDecodeError) as e:
             self._json(400, {"ok": False, "error": str(e)})
+            return
+        if _busy_project() in (src, dst):
+            self._json(409, {"ok": False, "error": "project has a run in progress"})
             return
         try:
             created = duplicate_project(src, dst)
@@ -460,6 +511,9 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, json.JSONDecodeError) as e:
             self._json(400, {"ok": False, "error": str(e)})
             return
+        if _busy_project() in (src, dst):
+            self._json(409, {"ok": False, "error": "project has a run in progress"})
+            return
         try:
             moved = rename_project(src, dst)
         except FileExistsError as e:
@@ -476,17 +530,8 @@ class Handler(BaseHTTPRequestHandler):
     def _input_videos(self) -> None:
         """List videos staged in input/ + existing projects (for collision warn) +
         whether the Hyperframes producer is up (reel step 6 needs it)."""
-        videos = []
-        if INPUT_DIR.exists():
-            seen = set()
-            for ext in VIDEO_EXTS:
-                for p in INPUT_DIR.glob(f"*{ext}"):
-                    if p.name in seen:
-                        continue
-                    seen.add(p.name)
-                    videos.append({"name": p.name,
-                                   "sizeMB": round(p.stat().st_size / 1e6, 1)})
-            videos.sort(key=lambda v: v["name"].lower())
+        videos = [{"name": p.name, "sizeMB": round(p.stat().st_size / 1e6, 1)}
+                  for p in list_videos(INPUT_DIR)]
         self._json(200, {
             "ok": True,
             "hyperframesUp": _port_open(HYPERFRAMES_PORT),
@@ -531,6 +576,13 @@ class Handler(BaseHTTPRequestHandler):
                     remaining -= len(buf)
         except OSError as e:
             self._json(500, {"ok": False, "error": str(e)})
+            return
+        if remaining > 0:
+            # Client disconnected mid-body: a truncated video must not stay staged
+            # in input/ looking like a complete upload.
+            dest.unlink(missing_ok=True)
+            self._json(400, {"ok": False,
+                             "error": f"upload truncated ({remaining} bytes missing)"})
             return
         print(f"[sidecar] uploaded {dest.name} ({length / 1e6:.1f} MB)")
         self._json(202, {"ok": True, "name": dest.name, "savedAs": f"input/{dest.name}"})

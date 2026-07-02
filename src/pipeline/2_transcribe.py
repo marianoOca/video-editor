@@ -23,59 +23,32 @@ Usage: python3 2_transcribe.py [--model medium] [--lang es]
 
 import subprocess
 import json
+import os
 import re
 import sys
 import argparse
 from pathlib import Path
-from config import OUT_DIR, REMOTION_DIR, SRC_DIR, get_duration, run_ffmpeg, silencedetect
+from config import (OUT_DIR, REMOTION_DIR, SRC_DIR, WHISPER_SAMPLE_RATE,
+                    get_duration, run_ffmpeg, silencedetect)
+from tuning import (
+    SEGMENT_GAP_SEC, MAX_WORD_DUR, MAX_NUM_WORD_DUR, SUBTOKEN_TAIL,
+    CONF_REANCHOR, CHAR_CONTIG_TOL,
+    CHUNK_TRIGGER_SEC, CHUNK_TARGET_SEC, CHUNK_SEARCH_SEC, CHUNK_MIN_SEC,
+    CHUNK_EDGE_PAD, CHUNK_SILENCE_DB, CHUNK_SILENCE_MIN,
+)
 
 WHISPER_DIR = SRC_DIR.parent / "whisper.cpp"
 TRANSCRIBE_SCRIPT = REMOTION_DIR / "scripts" / "transcribe.mjs"
 
-# Gap between words that forces a new segment even without sentence punctuation
-SEGMENT_GAP_SEC = 1.0
-
-# Max word duration (seconds). Whisper.cpp gives accurate word STARTS (DTW) but
-# no reliable word ends, so each end is derived from the next word's start and
-# capped here — otherwise a word before a pause stretches across the whole gap.
-MAX_WORD_DUR = 0.7
-
-# Spoken multi-word numbers ("ciento veinte", "dos mil veinticuatro") collapse into a
-# single digit token ("120", "2024"); the 0.7s cap then truncates the word to its first
-# syllables and the rest is cut as a phantom no-speech gap (see merge_tokens_to_words
-# note re "ciento veinte"->"120"). Numeric tokens get a wider cap so the keep block covers
-# the whole spoken number. 3.0s covers any number a person says aloud in one breath.
-MAX_NUM_WORD_DUR = 3.0
-
-# Word-timestamp repair (transcript-internal, no energy). Whisper's DTW onset can
-# hallucinate a LOW-confidence token's start backward into a pause; its char-offset
-# (which tiles within contiguous speech) is then the better onset. See
-# merge_tokens_to_words for the signed-direction re-anchor + char-contiguity merge.
-CONF_REANCHOR = 0.6     # only re-anchor tokens whisper itself flagged unsure
-CHAR_CONTIG_TOL = 0.06  # seconds — char-offsets tile (==) for true sub-word splits
-
 SENTENCE_END_RE = re.compile(r"[.!?…]+$")
-
-# --- Chunked transcription (long-audio hallucination guard) -----------------
-# Long files trip whisper's long-form context loop (repeated phrases + DTW
-# timestamp collapse). We split at pauses into ~1-min chunks, each a fresh
-# whisper call, so no previous-text context carries across a boundary.
-CHUNK_TRIGGER_SEC = 90.0    # only chunk when audio is longer than this
-CHUNK_TARGET_SEC = 60.0     # aim for ~1-min chunks
-CHUNK_SEARCH_SEC = 20.0     # search this far around the target for a pause to split on
-CHUNK_MIN_SEC = 20.0        # never emit a chunk shorter than this (absorb the tail)
-CHUNK_EDGE_PAD = 0.25       # seconds — keep this much silence around each chunk's
-                            # speech; a longer trailing silence crashes whisper.cpp's
-                            # DTW pass (WHISPER_ASSERT filter_width < a->ne[2])
-CHUNK_SILENCE_DB = -30      # dB — split only in confident pauses (quieter than this)
-CHUNK_SILENCE_MIN = 0.5     # seconds — min pause length to be a split candidate
 
 
 def extract_audio(video: Path, audio: Path):
     """Whisper.cpp requires 16kHz mono WAV."""
     print("  extracting audio...")
     run_ffmpeg(
-        ["ffmpeg", "-y", "-i", str(video), "-ar", "16000", "-ac", "1", "-f", "wav", str(audio)]
+        ["ffmpeg", "-y", "-i", str(video), "-ar", str(WHISPER_SAMPLE_RATE),
+         "-ac", "1", "-f", "wav", str(audio)]
     )
 
 
@@ -185,11 +158,16 @@ def transcribe_audio(audio: Path, model: str, lang: str) -> list[dict]:
     for i, (start, end) in enumerate(chunks):
         cache = cache_dir / f"chunk_{i:03d}.json"
         if cache.exists():
-            data = json.loads(cache.read_text(encoding="utf-8"))
+            # Guarded parse: a run interrupted mid-write leaves a truncated json;
+            # crashing on it would break the resumability the cache exists for.
+            try:
+                data = json.loads(cache.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                data = {}
             if (data.get("audio_size") == audio_size and data.get("model") == model
                     and data.get("lang") == lang
-                    and abs(data["start"] - start) < 0.01
-                    and abs(data["end"] - end) < 0.01):
+                    and abs(data.get("start", -1) - start) < 0.01
+                    and abs(data.get("end", -1) - end) < 0.01):
                 print(f"  chunk {i + 1}/{len(chunks)}: {start:.1f}s–{end:.1f}s "
                       f"(cached, {len(data['captions'])} tokens)")
                 all_captions.extend(data["captions"])
@@ -198,15 +176,17 @@ def transcribe_audio(audio: Path, model: str, lang: str) -> list[dict]:
               f"({end - start:.1f}s)")
         run_ffmpeg(
             ["ffmpeg", "-y", "-ss", f"{start:.3f}", "-t", f"{end - start:.3f}",
-             "-i", str(audio), "-ar", "16000", "-ac", "1", "-f", "wav",
-             str(chunk_wav)]
+             "-i", str(audio), "-ar", str(WHISPER_SAMPLE_RATE), "-ac", "1",
+             "-f", "wav", str(chunk_wav)]
         )
         captions = _offset_captions(_run_whisper(chunk_wav, chunk_json, model, lang),
                                     start)
-        cache.write_text(json.dumps({"audio_size": audio_size, "model": model,
-                                     "lang": lang, "start": start, "end": end,
-                                     "captions": captions}, ensure_ascii=False),
-                         encoding="utf-8")
+        tmp = cache.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"audio_size": audio_size, "model": model,
+                                   "lang": lang, "start": start, "end": end,
+                                   "captions": captions}, ensure_ascii=False),
+                       encoding="utf-8")
+        os.replace(tmp, cache)  # atomic: never leave a half-written cache entry
         all_captions.extend(captions)
 
     # Persist the merged token stream for debugging, mirroring single-pass output.
@@ -270,9 +250,17 @@ def merge_tokens_to_words(captions: list[dict]) -> tuple[list[dict], list[dict]]
         start_ms = c.get("timestampMs")
         if start_ms is None:
             start_ms = c.get("startMs")  # fallback when DTW is unavailable
-        if not raw.strip() or start_ms is None or re.fullmatch(r'[.…]+', raw.strip()):
+        if not raw.strip() or start_ms is None or raw.strip() == ".":
+            # A lone "." is detached sentence punctuation — noise. Multi-dot runs
+            # ("...", "…") are different: whisper emits them for REAL speech it
+            # could not decode (e.g. "Claude" -> 'cl' + '...'), so they flow
+            # through as "…" tokens — their DTW extends the word's coverage and
+            # the "…" stays visible (and editable) in the Subtitles tab instead
+            # of surfacing as an untranscribed audio island.
             dropped += 1
             continue
+        if re.fullmatch(r"[.…]+", raw.strip()):
+            raw = (" " if raw.startswith(" ") else "") + "…"
 
         # Two per-token clocks: dtw (DTW/attention onset, accurate across pauses)
         # and chs/che (char-offset start/end, which TILE contiguously within a
@@ -305,9 +293,12 @@ def merge_tokens_to_words(captions: list[dict]) -> tuple[list[dict], list[dict]]
         far = bool(words) and ts - words[-1]["start"] > MAX_WORD_DUR
         starts_word = raw.startswith(" ") or not words or (far and not char_contig)
         if starts_word:
-            words.append({"word": raw.strip(), "start": ts})
+            words.append({"word": raw.strip(), "start": ts, "_last": ts})
         else:
-            words[-1]["word"] += raw.strip()
+            text = raw.strip()
+            if not (text == "…" and words[-1]["word"].endswith("…")):
+                words[-1]["word"] += text
+            words[-1]["_last"] = max(words[-1]["_last"], ts)
         prev_char_end = che
     close_run()  # in case a run never closed its bracket
 
@@ -316,14 +307,23 @@ def merge_tokens_to_words(captions: list[dict]) -> tuple[list[dict], list[dict]]
     if nonspeech:
         print(f"  marked {len(nonspeech)} non-speech region(s) from bracketed tokens")
 
-    # Force monotonic starts, then derive each end from the next start (capped)
+    # Force monotonic starts, then derive each end from the next start (capped).
+    # The cap ceiling stretches to the word's last sub-token DTW (+SUBTOKEN_TAIL):
+    # that onset proves audio was still running there, so the word may exceed
+    # MAX_WORD_DUR — but never past the next word's start.
     for i in range(1, len(words)):
         if words[i]["start"] < words[i - 1]["start"]:
             words[i]["start"] = words[i - 1]["start"]
     for i, w in enumerate(words):
-        next_start = words[i + 1]["start"] if i + 1 < len(words) else w["start"] + MAX_WORD_DUR
+        next_start = words[i + 1]["start"] if i + 1 < len(words) else float("inf")
         cap = MAX_NUM_WORD_DUR if re.match(r"\s*\d[\d.,]*", w["word"]) else MAX_WORD_DUR
-        w["end"] = min(max(next_start, w["start"]), w["start"] + cap)
+        # "evidence" (kept in transcript.json) = last sub-token DTW onset: the
+        # latest instant the word's audio is PROVEN to still be running. Step 3
+        # snaps a keep block's end to the first silence after it — never before,
+        # which would cut the extension right back off.
+        w["evidence"] = w.pop("_last")
+        ceiling = max(w["start"] + cap, w["evidence"] + SUBTOKEN_TAIL)
+        w["end"] = min(max(next_start, w["start"]), ceiling)
     return words, nonspeech
 
 

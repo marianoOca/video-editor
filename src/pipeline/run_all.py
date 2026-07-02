@@ -29,7 +29,6 @@ import os
 import subprocess
 import sys
 import argparse
-import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -48,12 +47,16 @@ def derive_project_name(args, input_dir: Path):
     if args.input:
         return Path(args.input[0]).stem
     if args.from_step == 1:
-        vids = sorted(
-            [*input_dir.glob("*.mp4"), *input_dir.glob("*.mov")],
-            key=lambda p: p.name.lower(),
-        )
-        if vids:
-            return vids[0].stem
+        # Same selection rule as config.list_videos (case-insensitive extension,
+        # lowercase-name sort). Deliberately duplicated: importing config here
+        # would resolve — and cache — the active project BEFORE main() sets
+        # VE_PROJECT, so a stale state file would hijack a fresh run.
+        if input_dir.exists():
+            vids = sorted((p for p in input_dir.iterdir()
+                           if p.is_file() and p.suffix.lower() in (".mp4", ".mov")),
+                          key=lambda p: p.name.lower())
+            if vids:
+                return vids[0].stem
     return None
 
 
@@ -161,14 +164,6 @@ def main():
         run_step(script, extra)
 
     print("\n🎬 Pipeline complete.")
-    # Copy music assets to public folder for Remotion
-    src_music = Path(__file__).parent.parent / "src" / "remotion" / "src" / "caro" / ".." / ".." / "assets" / "music"
-    dest_music = Path(__file__).parent.parent / "src" / "remotion" / "public" / "music"
-    if src_music.is_dir():
-        shutil.copytree(src_music, dest_music, dirs_exist_ok=True)
-        print(f"✅ Copied music assets to {dest_music}")
-    else:
-        print("⚠️ No music assets found to copy.")
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ import sys
 import argparse
 from pathlib import Path
 from config import (
-    INPUT_DIR, OUT_DIR, MODE_PATH, probe, run_ffmpeg,
+    INPUT_DIR, OUT_DIR, MODE_PATH, probe, run_ffmpeg, list_videos,
     REEL_W, REEL_H, YT_W, YT_H, VIDEO_FPS,
     FFMPEG_X264_FAST_ARGS, FFMPEG_AAC_STEREO_ARGS,
 )
@@ -105,7 +105,11 @@ def concatenate(norm_files: list[Path], out: Path):
     list_file = OUT_DIR / "concat_list.txt"
     with open(list_file, "w") as f:
         for p in norm_files:
-            f.write(f"file '{p.resolve()}'\n")
+            # The concat demuxer requires apostrophes inside a quoted path to be
+            # escaped as '\'' — an unescaped one ("Mariano's Files") misparses and
+            # kills the run after all the slow per-clip re-encodes.
+            quoted = str(p.resolve()).replace("'", "'\\''")
+            f.write(f"file '{quoted}'\n")
 
     cmd = [
         "ffmpeg", "-y", "-f", "concat", "-safe", "0",
@@ -142,7 +146,7 @@ def main():
                 sys.exit(1)
             videos.append(p)
     else:
-        videos = sorted([v for ext in ("*.mp4", "*.mov") for v in INPUT_DIR.glob(ext)])
+        videos = list_videos(INPUT_DIR)
     if not videos:
         print("ERROR: no videos found in input/")
         sys.exit(1)

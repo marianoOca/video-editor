@@ -23,6 +23,13 @@ Using Remotion as a base, a Python pipeline for automatic editing of YouTube and
 Pulled from memory `known_issues_pipeline` — verify still live before relying on these.
 - **Reel `final.mp4` has no captions** — step 5 (motion graphics) overwrites the step-4 render that carried captions.
 - **On-video caption edit writes to a stale `VideoEditor` id** in some paths instead of the active project id.
+- **Soft trailing speech below -35dB gets clipped at block ends** ("School" tail, a final soft
+  "día" cut mid-word). Pre-existing; slightly amplified by the voice bandpass in
+  `config.silencedetect`. Chosen fix direction: adaptive per-video silence floor — full
+  self-contained brief in `src/HANDOFF_adaptive_silence_floor.md` (implement in a clean session).
+- ~~Words clipped/skipped at cut boundaries~~ **FIXED Jul 2026** (memory `clipped_words_diagnosis`):
+  word extent from sub-token DTW (`evidence` field), energy safety net in step 3 (bounded rescue),
+  overlap-rule caption mapping, `…` tokens kept as words, silence-margin on hallucination drop.
 
 ## Maintenance
 Update this file when the active focus shifts, an issue opens/closes, or a deferred area becomes active.

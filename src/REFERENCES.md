@@ -8,7 +8,7 @@
 - Remotion docs: https://www.remotion.dev/docs
 - Custom Studio tabs (unshipped `registerStudioPanel`): https://github.com/remotion-dev/remotion/issues/7200 — why the Subtitles tab is a patch-package hack.
 - Hyperframes (motion graphics, step 5): `@hyperframes/cli` + `@hyperframes/producer`, producer on port 9847.
-- Related repo `../editor-pro-max` (separate, not a dependency): only the per-project-composition + Studio `<Folder>` idiom was borrowed. video-editor stays independent.
+- Reference repo `editor-pro-max/` (in-repo, **gitignored**, local-only, pristine clone; GitHub: https://github.com/Hainrixz/editor-pro-max.git). Not a dependency. Kept as a **solution source**: before building any new feature/pipeline edit/video technique, consult the map `editor-pro-max/EDITOR_PRO_MAX_LOOT.md` (~65 items rated steal/adapt/preserve/ref/skip + Part A end-user value + the two conflict lines) and adapt a proven solution rather than reinventing. Full workflow rule in CLAUDE.md → "Borrowing from editor-pro-max".
 
 ## Notes
 - **Memory index**: `~/.claude/projects/-Users-mar-Documents-Claude-Projects-FA-Automations-video-editor/memory/MEMORY.md` — deep notes live here (Studio custom tab, native delete, whisper fixes, cut architecture, etc.). Check it before re-discovering a gotcha.
