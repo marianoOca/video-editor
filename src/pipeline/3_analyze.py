@@ -38,11 +38,15 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from config import OUT_DIR, get_duration, call_claude, silencedetect
+import re
+from typing import Optional
+from config import (OUT_DIR, MODE_PATH, get_duration, call_claude, silencedetect,
+                    probe, run_ffmpeg, VOICE_BANDPASS)
 from tuning import (
     MAX_KEEP_GAP, KEEP_PAD, MIN_SEGMENT, NONSPEECH_PAD, SILENT_WORD_MARGIN,
     ENERGY_NET_MIN_BURST, ENERGY_NET_MAX_GAP, ENERGY_NET_LONG_BURST,
     ENERGY_NET_LONG_GAP, ENERGY_NET_MAX_BURST,
+    ENERGY_NET_FLAT_STD_DB, ENERGY_NET_FLAT_MIN_DUR, FLAT_WINDOW_SEC,
     SILENCE_DB, SILENCE_MIN, SNAP_LEAD, SNAP_SLOP, SNAP_MIN,
     REPETITION_CHUNK_SEC, REPETITION_CHUNK_OVERLAP,
 )
@@ -59,14 +63,55 @@ def flatten_words(transcript: dict) -> list[dict]:
     return words
 
 
-def detect_silences(video: Path, total_duration: float) -> list[dict]:
+def resolve_silence_db() -> float:
+    """Per-video silence threshold: step 1 measures the recording's noise floor
+    and writes silence_db into mode.json (knobs in tuning.py's step-1 section).
+    Falls back to the fixed SILENCE_DB when mode.json is absent or predates the
+    field, so old projects re-analyze byte-identically."""
+    if MODE_PATH is not None and MODE_PATH.exists():
+        return float(json.loads(MODE_PATH.read_text()).get("silence_db", SILENCE_DB))
+    return SILENCE_DB
+
+
+def detect_silences(video: Path, total_duration: float,
+                    noise_db: float = SILENCE_DB) -> list[dict]:
     """Silence intervals [{start, end}] via the shared config.silencedetect helper.
     Used only to snap keep-block edges to real speech boundaries. Passing
     total_duration closes a trailing pause that ends at EOF (which silencedetect
     would otherwise leave unpaired)."""
     return [{"start": s, "end": e}
-            for s, e in silencedetect(video, SILENCE_DB, SILENCE_MIN,
+            for s, e in silencedetect(video, noise_db, SILENCE_MIN,
                                       total_duration=total_duration)]
+
+
+def burst_rms_std(video: Path, start: float, end: float) -> float:
+    """Std of the voice-band windowed RMS over [start, end], in dB.
+
+    A speech fragment has phoneme structure (RMS peaks and valleys, high std);
+    steady background noise is flat (low std). Used by the energy net to tell a
+    mistimed word from noise. Same VOICE_BANDPASS + windowed-RMS form as
+    1_normalize.measure_silence_floor so the numbers are comparable. Returns a
+    large sentinel when too few windows are measured, so a too-short segment is
+    never mistaken for flat noise.
+    """
+    data = probe(video)
+    astream = next((s for s in data["streams"] if s["codec_type"] == "audio"), None)
+    if astream is None:
+        return 99.0
+    window = max(1, int(int(astream["sample_rate"]) * FLAT_WINDOW_SEC))
+    proc = run_ffmpeg(
+        ["ffmpeg", "-ss", f"{start}", "-t", f"{end - start}", "-i", str(video),
+         "-af", (f"{VOICE_BANDPASS},asetnsamples=n={window},"
+                 "astats=metadata=1:reset=1,"
+                 "ametadata=print:key=lavfi.astats.Overall.RMS_level"),
+         "-f", "null", "-"]
+    )
+    vals = [float(m) for m in
+            re.findall(r"RMS_level=(-?[\d.]+(?:[eE][+-]?\d+)?)", proc.stderr or "")]
+    if len(vals) < 2:
+        return 99.0
+    mean = sum(vals) / len(vals)
+    return (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
 
 
 def drop_silent_words(words: list[dict],
@@ -175,7 +220,8 @@ def build_keep_blocks(words: list[dict], silences: list[dict],
 
 
 def extend_keeps_to_adjacent_speech(keep: list[dict], silences: list[dict],
-                                    total_duration: float) -> tuple[list[dict], int]:
+                                    total_duration: float,
+                                    video: Optional[Path] = None) -> tuple[list[dict], int]:
     """Energy safety net: rescue real speech the transcript mistimed.
 
     Keep = word coverage, so wherever whisper's word timing is wrong the real
@@ -185,13 +231,19 @@ def extend_keeps_to_adjacent_speech(keep: list[dict], silences: list[dict],
     almost always that mistimed speech — a late DTW onset or a capped word end.
     The nearest keep is extended to cover the burst.
 
-    Three bounds protect the word-first design (each covers a verified failure):
+    Four bounds protect the word-first design (each covers a verified failure):
     keeps are only ever EXTENDED, never created (isolated noise stays cut); a
     rescue is capped at ENERGY_NET_MAX_BURST (sustained audio fused to a speech
-    edge — music, typing, a second voice — is not a mistimed word); and a burst
+    edge — music, typing, a second voice — is not a mistimed word); a burst
     spanning keep-edge to keep-edge is skipped (that is a pause silencedetect
     missed — re-gluing it would undo a word-gap cut, and with no detected
-    silences at all it would undo EVERY cut).
+    silences at all it would undo EVERY cut); and a burst whose voice-band RMS is
+    too FLAT (steady background noise, not phoneme-structured speech) is skipped
+    when ``video`` is given — timing and loudness alone can't tell a loud noise
+    burst from a late word onset, but temporal shape can.
+
+    ``video`` is optional: without it the flatness gate is skipped, keeping the
+    function usable in pure-timing tests.
 
     Returns (new_keep, bursts_rescued).
     """
@@ -250,6 +302,12 @@ def extend_keeps_to_adjacent_speech(keep: list[dict], silences: list[dict],
                        else ENERGY_NET_MAX_GAP)
             if gap_to(keep[idx]) > max_gap:
                 continue
+            # Flatness gate: a sustained burst with steady voice-band energy is
+            # background noise (hum, room tone), not a mistimed word. Only the
+            # long ones matter and only they justify the measurement cost.
+            if (video is not None and pb - pa >= ENERGY_NET_FLAT_MIN_DUR
+                    and burst_rms_std(video, pa, pb) < ENERGY_NET_FLAT_STD_DB):
+                continue
             rescued += 1
             blocks[idx]["start"] = min(blocks[idx]["start"], pa)
             blocks[idx]["end"] = max(blocks[idx]["end"], pb)
@@ -293,6 +351,37 @@ def cut_silence_gaps(keep: list[dict], silences: list[dict],
     if not cuts:
         return keep, []
     return subtract_intervals(keep, cuts), cuts
+
+
+def guard_two_sided_rescues(base_keep: list[dict], net_keep: list[dict],
+                            min_gap: float) -> tuple[list[dict], list[dict]]:
+    """Revert energy-net rescues that bridged a long word-gap from BOTH sides.
+
+    build_keep_blocks splits on word-coverage gaps; a legitimate mistiming rescue
+    (capped tail OR late onset) is one-sided and leaves a real cut on the other
+    side. Background noise filling a pause is the only case that gets rescued from
+    BOTH bounding blocks at once, collapsing a gap the word split had cut. Such a
+    gap (longer than min_gap = the gap-cut threshold, and covered by the net past
+    BOTH of its base edges) is cut straight back to the build_keep_blocks edges.
+    Only ever reverts to base edges, so no word-covered audio is ever cut.
+
+    Coverage-based (not block-identity), so it stays correct even if the rescues
+    merged two base blocks into one that spans the whole gap.
+
+    Returns (new_keep, reverted_cuts).
+    """
+    cuts = []
+    for a, b in zip(base_keep, base_keep[1:]):
+        gL, gR = a["end"], b["start"]
+        if gR - gL < min_gap:
+            continue
+        covers_left = any(k["start"] <= gL + 1e-6 < k["end"] for k in net_keep)
+        covers_right = any(k["start"] < gR - 1e-6 <= k["end"] for k in net_keep)
+        if covers_left and covers_right:
+            cuts.append({"start": gL, "end": gR})
+    if not cuts:
+        return net_keep, cuts
+    return subtract_intervals(net_keep, cuts), cuts
 
 
 def _format_words_for_prompt(words: list[dict]) -> str:
@@ -442,7 +531,9 @@ def main():
     words = flatten_words(transcript)
     print(f"  Transcript words: {len(words)}")
 
-    silences = detect_silences(combined, total_duration)
+    silence_db = resolve_silence_db()
+    print(f"  silence threshold: {silence_db:.1f} dB")
+    silences = detect_silences(combined, total_duration, silence_db)
 
     words, dropped_silent = drop_silent_words(words, silences)
     if dropped_silent:
@@ -451,15 +542,25 @@ def main():
         print(f"  dropped {len(dropped_silent)} word(s) stranded in silence "
               f"(whisper hallucination): {detail}")
 
-    keep = build_keep_blocks(words, silences, total_duration)
+    base_keep = build_keep_blocks(words, silences, total_duration)
     print(f"  Keep blocks (word coverage, edges snapped to silence): "
-          f"{len(keep)} ({_sum_duration(keep):.1f}s)")
+          f"{len(base_keep)} ({_sum_duration(base_keep):.1f}s)")
 
     # Energy safety net: rescue real speech whisper mistimed (late DTW onset,
-    # capped word end) — uncovered speech bursts adjacent to a keep edge.
-    keep, rescued = extend_keeps_to_adjacent_speech(keep, silences, total_duration)
+    # capped word end) — uncovered speech bursts adjacent to a keep edge. Passing
+    # the video enables the flatness gate that rejects steady-noise bursts.
+    keep, rescued = extend_keeps_to_adjacent_speech([dict(b) for b in base_keep],
+                                                    silences, total_duration, combined)
     if rescued:
         print(f"  energy net: rescued {rescued} uncovered speech burst(s) "
+              f"→ {len(keep)} blocks ({_sum_duration(keep):.1f}s)")
+
+    # Revert net rescues that bridged a long word-gap from BOTH sides — the
+    # signature of intermittent noise filling a pause (a legit mistiming is
+    # one-sided). Reverts only to build_keep_blocks edges, never cutting speech.
+    keep, two_sided = guard_two_sided_rescues(base_keep, keep, MAX_KEEP_GAP + 2 * KEEP_PAD)
+    if two_sided:
+        print(f"  reverted {len(two_sided)} two-sided noise rescue(s) "
               f"→ {len(keep)} blocks ({_sum_duration(keep):.1f}s)")
 
     # Cut real silence that words bridged into a block. whisper.cpp has no

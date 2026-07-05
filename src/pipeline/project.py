@@ -84,9 +84,12 @@ def cmd_rebuild(args):
 
 def cmd_delete(args):
     name = sanitize_project_name(args.name)
+    del_input = args.input or args.all
+    del_output = args.output or args.all
     # delete_project wipes data dir + snapshot + public assets, clears the
-    # active-project state if it pointed here, and regenerates Root.tsx.
-    removed = delete_project(name)
+    # active-project state if it pointed here, and regenerates Root.tsx. --input /
+    # --output / --all also unlink the project's shared source/rendered files.
+    removed = delete_project(name, delete_input=del_input, delete_output=del_output)
     if not removed:
         print(f"project '{name}' not found (nothing to delete).")
         return
@@ -109,6 +112,12 @@ def main():
 
     p_delete = sub.add_parser("delete", help="Delete a project")
     p_delete.add_argument("name")
+    p_delete.add_argument("--input", action="store_true",
+                          help="Also delete the project's source video(s) under input/")
+    p_delete.add_argument("--output", action="store_true",
+                          help="Also delete the project's rendered output(s)")
+    p_delete.add_argument("--all", action="store_true",
+                          help="Also delete both source and output files")
     p_delete.set_defaults(func=cmd_delete)
 
     args = parser.parse_args()

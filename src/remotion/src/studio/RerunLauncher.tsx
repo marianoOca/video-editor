@@ -75,12 +75,12 @@ const Modal: React.FC<{ project: string; onClose: () => void }> = ({ project, on
   const [fromStep, setFromStep] = useState(2); // default: --from 2
   const [hasInput, setHasInput] = useState(true);
   const [hyperframesUp, setHyperframesUp] = useState(true);
-  const [jobRunning, setJobRunning] = useState(false);
+  const [queueCount, setQueueCount] = useState(0); // jobs running/queued right now
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // On open: step-1 availability + Hyperframes status, and whether a run is already
-  // in flight (only one job at a time — the sidebar row owns its progress).
+  // On open: step-1 availability + Hyperframes status, and how many jobs are
+  // already running/queued (this re-run joins the FIFO queue after them).
   useEffect(() => {
     (async () => {
       const { ok, body } = await fetchJSON("/input-videos");
@@ -89,7 +89,11 @@ const Modal: React.FC<{ project: string; onClose: () => void }> = ({ project, on
         setHyperframesUp(Boolean(body.hyperframesUp));
       }
       const st = await fetchJSON("/pipeline-status");
-      if (st.ok && st.body.job && st.body.job.state === "running") setJobRunning(true);
+      if (st.ok && Array.isArray(st.body.jobs)) {
+        setQueueCount(
+          st.body.jobs.filter((j: any) => j.state === "running" || j.state === "queued").length
+        );
+      }
     })();
   }, []);
 
@@ -99,7 +103,7 @@ const Modal: React.FC<{ project: string; onClose: () => void }> = ({ project, on
   }, [hasInput, fromStep]);
 
   const rerun = useCallback(async () => {
-    if (submitting || jobRunning) return;
+    if (submitting) return;
     setSubmitting(true);
     setError(null);
     const { ok, status, body } = await fetchJSON("/rerun-pipeline", {
@@ -111,18 +115,20 @@ const Modal: React.FC<{ project: string; onClose: () => void }> = ({ project, on
       setSubmitting(false);
       setError(
         status === 409
-          ? "A pipeline run is already active — wait for it to finish."
+          ? "This project already has a job queued or running — cancel it first (✕ on its row) to re-queue."
           : body.error || `request failed (${status})`
       );
       return;
     }
-    // Hand the run off to the sidebar's pending-project row (NewProjectLauncher
-    // listens for this), then get out of the way.
+    // Hand the job off to the sidebar row (NewProjectLauncher listens for this): it
+    // queues behind any running/queued jobs and runs in turn. Get out of the way.
     window.dispatchEvent(
-      new CustomEvent("ve-job-started", { detail: { project: body.project || project } })
+      new CustomEvent("ve-job-started", {
+        detail: { project: body.project || project, id: body.jobId, state: body.state },
+      })
     );
     onClose();
-  }, [submitting, jobRunning, project, fromStep, onClose]);
+  }, [submitting, project, fromStep, onClose]);
 
   const onKeyDown = (e: React.KeyboardEvent) => {
     e.stopPropagation(); // Studio binds global shortcuts; keep keystrokes local.
@@ -131,7 +137,7 @@ const Modal: React.FC<{ project: string; onClose: () => void }> = ({ project, on
 
   // Steps 5-6 need the Hyperframes producer (reel mode); warn if the run reaches them.
   const willHitMotion = fromStep <= 6 && !hyperframesUp;
-  const disabled = submitting || jobRunning;
+  const disabled = submitting;
 
   return (
     <div style={overlayStyle} onClick={() => !submitting && onClose()}>
@@ -207,10 +213,11 @@ const Modal: React.FC<{ project: string; onClose: () => void }> = ({ project, on
           </div>
         ) : null}
 
-        {jobRunning ? (
+        {queueCount > 0 ? (
           <div style={{ marginTop: 14, color: MUTED, fontSize: 12 }}>
-            A pipeline run is already active — wait for it to finish (its progress shows
-            under that project's row in the list).
+            {queueCount} job{queueCount > 1 ? "s" : ""} already running/queued — this re-run
+            joins the queue and starts when they finish (progress shows under each
+            project's row).
           </div>
         ) : null}
         {error ? (
@@ -222,7 +229,7 @@ const Modal: React.FC<{ project: string; onClose: () => void }> = ({ project, on
             Cancel
           </button>
           <button onClick={rerun} style={{ ...btn(true), opacity: disabled ? 0.5 : 1 }} disabled={disabled}>
-            {submitting ? "Starting…" : `Re-run from step ${fromStep}`}
+            {submitting ? "Queuing…" : queueCount > 0 ? `Add to queue (step ${fromStep})` : `Re-run from step ${fromStep}`}
           </button>
         </div>
       </div>

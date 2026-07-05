@@ -1,8 +1,8 @@
 diff --git a/node_modules/@remotion/studio-server/dist/preview-server/routes/apply-codemod.js b/node_modules/@remotion/studio-server/dist/preview-server/routes/apply-codemod.js
-index ec82965..7dc142c 100644
+index ec82965..2dd9070 100644
 --- a/node_modules/@remotion/studio-server/dist/preview-server/routes/apply-codemod.js
 +++ b/node_modules/@remotion/studio-server/dist/preview-server/routes/apply-codemod.js
-@@ -64,6 +64,109 @@ const getCodemodUndoDescription = (codemod) => {
+@@ -64,6 +64,113 @@ const getCodemodUndoDescription = (codemod) => {
  const applyCodemodHandler = async ({ input: { codemod, dryRun, symbolicatedStack }, logLevel, remotionRoot, entryPoint, }) => {
      var _a;
      try {
@@ -36,7 +36,11 @@ index ec82965..7dc142c 100644
 +            const res = await fetch(`${SIDECAR}/delete-project`, {
 +                method: 'POST',
 +                headers: { 'content-type': 'application/json' },
-+                body: JSON.stringify({ project: codemod.idToDelete }),
++                body: JSON.stringify({
++                    project: codemod.idToDelete,
++                    deleteInput: !!codemod.deleteInput,
++                    deleteOutput: !!codemod.deleteOutput,
++                }),
 +            });
 +            if (!res.ok) {
 +                const data = await res.json().catch(() => ({}));

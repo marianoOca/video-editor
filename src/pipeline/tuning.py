@@ -13,6 +13,28 @@ live in config.py — they are requirements, not taste.
 """
 
 # ============================================================================
+# Step 1 — normalize / noise-floor measurement (1_normalize.py)
+# ============================================================================
+
+# Adaptive silence threshold: instead of trusting one absolute dB for every
+# recording, step 1 measures the video's own noise floor (a low percentile of
+# windowed voice-band RMS) and writes silence_db = floor + margin (clamped) into
+# mode.json for step 3. Different mics/rooms shift the floor; the fixed -35dB
+# clipped soft word tails on quiet-floor recordings (measured evidence in
+# src/HANDOFF_adaptive_silence_floor.md). Step 3 falls back to SILENCE_DB when
+# mode.json predates this field.
+FLOOR_WINDOW_SEC = 0.5   # seconds — RMS measurement window
+FLOOR_PERCENTILE = 10    # low percentile of window RMS = the noise floor
+                         # (most windows contain speech; the low tail is room tone)
+FLOOR_MARGIN_DB = 10.0   # threshold sits this far above the measured floor
+FLOOR_DB_MIN = -38.0     # clamp: threshold never stricter than this. Validated
+                         # July 2026 on two quiet-floor projects: -38 fixed the
+                         # clipped soft tails at +~1% duration; -45 tripled the
+                         # duration cost and flipped more knife-edge snap
+                         # decisions for no extra tail coverage.
+FLOOR_DB_MAX = -30.0     # ...and never looser — protects against a bad measurement
+
+# ============================================================================
 # Step 2 — transcription (2_transcribe.py)
 # ============================================================================
 
@@ -91,6 +113,24 @@ ENERGY_NET_MAX_GAP = 0.3
 ENERGY_NET_LONG_BURST = 0.5
 ENERGY_NET_LONG_GAP = 0.5
 ENERGY_NET_MAX_BURST = 1.5
+
+# The energy net rescues MISTIMED SPEECH, but steady background noise (hum, room
+# tone, a fan — sitting above the silence floor) also survives silencedetect and
+# can abut a keep edge, so it is indistinguishable from a late word onset on
+# timing OR loudness alone (a measured noise burst landed dead-centre in the
+# legit-rescue dB range). The separator is temporal shape: speech has phoneme
+# structure (peaks and valleys), steady noise is flat. A rescue-candidate burst
+# whose voice-band RMS varies LESS than this (std across FLAT_WINDOW_SEC windows)
+# is treated as noise, not a word, and left cut. 4.0 dB sits below every measured
+# legit rescue (std >= 4.6) and above the flagged noise (std ~2.9) with margin.
+ENERGY_NET_FLAT_STD_DB = 4.0
+# Only flatness-test bursts at least this long: a shorter burst adds negligible
+# audio, and a quiet word onset can itself look flat, so testing it risks a false
+# cut. The noise this exists to catch is always the sustained (~1s) kind.
+ENERGY_NET_FLAT_MIN_DUR = 0.5
+# RMS-window length for the flatness measurement — the std is only meaningful
+# against a fixed window (mirrors FLOOR_WINDOW_SEC's role in step 1).
+FLAT_WINDOW_SEC = 0.1
 
 # Edge-snapping: word DTW starts can land late (clipping a word's onset) and
 # capped word ends overshoot into trailing noise. We snap each keep block's

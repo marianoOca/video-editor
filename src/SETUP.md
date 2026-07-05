@@ -147,7 +147,7 @@ Step 6 hard-exits if the producer is not reachable on port 9847. If you don't ne
 
 ## 8. whisper.cpp transcription setup
 
-Transcription runs **whisper.cpp locally** (not WhisperX / Python) via `@remotion/install-whisper-cpp`, driven by `src/remotion/scripts/transcribe.mjs`. The build + model live at `$REPO/whisper.cpp/` (gitignored → absent on a fresh clone). Nothing to pip-install for transcription; everything runs locally.
+Transcription runs **whisper.cpp locally** (not WhisperX / Python) via `@remotion/install-whisper-cpp`, driven by `src/remotion/scripts/transcribe.mjs`. The build + model live at `$REPO/src/whisper.cpp/` (gitignored → absent on a fresh clone). Nothing to pip-install for transcription; everything runs locally.
 
 The install + model download happen automatically on the **first** `2_transcribe.py` run (the Node script calls `installWhisperCpp` + `downloadWhisperModel`). It needs `node` (≥18) and a C compiler (`make`, present on macOS via Xcode CLT).
 
@@ -161,7 +161,7 @@ cd "$REPO/src/pipeline"
 python3 2_transcribe.py          # (or run the full pipeline; it will reach this step)
 
 # 2. Apply the committed DTW short-window guard, then rebuild.
-cd "$REPO/whisper.cpp"
+cd "$REPO/src/whisper.cpp"
 grep -q 'n_frames / 2 > 7' whisper.cpp && echo "guard already applied — skip git apply" \
   || git apply "$REPO/src/whisper-dtw-shortwindow-guard.patch"
 make main                        # rebuild (~1 min, Apple clang, no cmake)
@@ -172,9 +172,9 @@ python3 2_transcribe.py
 ```
 
 Notes:
-- The auto-installer is a **one-time no-op** once `whisper.cpp/` + `main` exist — it never rebuilds. After editing/patching whisper sources you **must** manually `make main`; re-running `2_transcribe.py` alone won't pick up source changes.
+- The auto-installer is a **one-time no-op** once `src/whisper.cpp/` + `main` exist — it never rebuilds. After editing/patching whisper sources you **must** manually `make main`; re-running `2_transcribe.py` alone won't pick up source changes.
 - `git apply` is not idempotent — the `grep` guard above skips it if the patch is already present (avoids a confusing "patch does not apply").
-- A `rm -rf whisper.cpp` / reinstall (or `git restore`/`git checkout` inside that checkout) reverts to the pristine, **crashing** binary — re-run the guard steps.
+- A `rm -rf src/whisper.cpp` / reinstall (or `git restore`/`git checkout` inside that checkout) reverts to the pristine, **crashing** binary — re-run the guard steps.
 - A whisper.cpp version bump does NOT fix this (the unguarded assert persists to master; ≥1.7.4 breaks the make-only build). Full background in memory `whisper-dtw-assert-fix`.
 
 ---

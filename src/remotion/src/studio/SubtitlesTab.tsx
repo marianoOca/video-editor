@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import type { CaptionSegment } from "../schema";
 import { activeCaptionIndex } from "../caption-utils";
+import { useProjectBuild } from "./NewProjectLauncher";
 
 // Studio-chrome panel: the selected composition's transcript, grouped by cut,
 // with inline editing + a "display on video" toggle. Mounted into Remotion
@@ -433,15 +434,17 @@ export const SubtitlesTab: React.FC<{
   const [applying, setApplying] = useState(false);
   const [applyError, setApplyError] = useState<string | null>(null);
   const pendingCount = pendingDrops.size + pendingLines.size;
-  const [progress, setProgress] = useState(0);
-  const applySuccessRef = useRef(false);
-
 
   // ── Project health (corrupt-file detection + Fix) ───────────────────────────
   const [health, setHealth] = useState<{ corrupt: boolean; resumeStep: number | null } | null>(null);
-  // Fix runs as a background job tracked by the sidebar's in-list progress bar (same
-  // as "Re-run pipeline"), so only Apply drives the tab's own progress bar.
-  const busy = applying;
+  // Both Fix and Apply (re-cut) are background jobs now, tracked by the sidebar's
+  // in-list progress bar. Lock the tab (no edits, Apply disabled) while THIS project
+  // has a job queued or running, so nothing is edited into a snapshot that's about
+  // to be re-mapped. `applying` covers the brief window between POST and hand-off.
+  const projectBuild = useProjectBuild(project);
+  const jobActive =
+    !!projectBuild && (projectBuild.state === "running" || projectBuild.state === "queued");
+  const busy = applying || jobActive;
 
   // ── Auto-scroll (follow the playhead) ───────────────────────────────────────
   // The playhead arrives via window.__veSubtitleFrame, published by FrameBridge
@@ -588,35 +591,6 @@ export const SubtitlesTab: React.FC<{
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
   }, []);
-
-  // Fill progress bar while applying. No real signal from the sidecar (one blocking
-  // POST), so fill LINEARLY at a rate scaled to the video length — a longer video
-  // means a longer re-cut — reaching the 90% cap at ~that time. (Fix is a background
-  // job; its progress shows in the sidebar's in-list bar, not here.)
-  // Linear (not eased) so the bar keeps moving the whole time instead of pinning
-  // near the end. Snaps to 100% on success (applySuccessRef), resets on error.
-  useEffect(() => {
-    if (!busy) {
-      if (applySuccessRef.current) {
-        applySuccessRef.current = false;
-        setProgress(100);
-        const t = setTimeout(() => setProgress(0), 500);
-        return () => clearTimeout(t);
-      }
-      setProgress(0);
-      return;
-    }
-    setProgress(1);
-    const caps = captionsRef.current;
-    const videoMs = caps.length ? caps[caps.length - 1].endMs : 0;
-    const expectedMs = Math.max(8000, videoMs); // ~realtime re-cut; 8s floor
-    const TICK = 200;
-    const step = (90 / expectedMs) * TICK; // linear: hits 90% cap at expectedMs
-    const id = setInterval(() => {
-      setProgress((p) => Math.min(p + step, 90));
-    }, TICK);
-    return () => clearInterval(id);
-  }, [busy]);
 
   // Probe the selected project's artifacts on switch. Sidecar offline → leave
   // health null (no banner) so a stopped sidecar never raises a false alarm.
@@ -916,9 +890,12 @@ export const SubtitlesTab: React.FC<{
     });
   };
 
-  // Apply staged deletions: POST to the sidecar, which re-cuts the video via
-  // 4_render.py (--drop-cuts for whole cuts, --drop-ranges for single lines).
-  // Studio then hot-reloads the shorter composition.
+  // Apply staged deletions: POST to the sidecar, which persists the edited captions
+  // then ENQUEUES a background re-cut job (4_render.py --drop-cuts for whole cuts,
+  // --drop-ranges for single lines). Progress shows under the project's row in the
+  // list; when the job finishes the build store hard-reloads Studio to pick up the
+  // shorter composition (a reload is still needed — it drops the in-memory caption
+  // override and dodges @remotion/media's EncodingError on the hot-swapped file).
   const applyDrops = async () => {
     if (pendingCount === 0 || applying || !project) return;
     // Cancel a queued auto-save: it holds pre-cut captions and would otherwise
@@ -966,27 +943,24 @@ export const SubtitlesTab: React.FC<{
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
+        if (res.status === 409) {
+          throw new Error(data.error || "This project already has a job queued or running.");
+        }
         throw new Error(data.log || data.error || `sidecar error ${res.status}`);
       }
-      applySuccessRef.current = true;
-      // Clear the staged marks in STATE and the session store. We reload below, but
-      // the snapshot rewrite also triggers Studio HMR, which can re-render this tab
-      // against the new (shorter) captions BEFORE the reload resets React state. A mark
-      // left in state then re-attaches by index to whatever caption now occupies that
-      // slot — e.g. dropping a cut's first line leaves index 0 marked, which after the
-      // cut is the NEXT line. Emptying both here guarantees no stale mark survives even
-      // if the reload is delayed or a no-op.
+      // Enqueued. Clear the staged marks (the cut is committed to the queue) so no
+      // stale mark re-attaches by index to a caption that shifts after the cut. Hand
+      // off to the sidebar row via ve-job-started; the build store shows the recut's
+      // progress and hard-reloads Studio when the job completes. No reload here —
+      // the job hasn't run yet.
       setPendingDrops(new Set());
       setPendingLines(new Set());
       pendingStore.delete(project);
-      // Hard reload on success. The re-cut swaps edited.mp4 in place; @remotion/media's
-      // audio decoder can throw "EncodingError: Decoding error" on the hot-swapped file
-      // until a fresh load (a manual reload clears it). Reloading also resets the Studio
-      // store to the re-mapped snapshot the pipeline just wrote — so it doubles as the
-      // post-cut resync, and no stale caption override can survive to desync the track.
-      void data; // (captions come back via the reloaded snapshot, not the response)
-      window.location.reload();
-      return;
+      window.dispatchEvent(
+        new CustomEvent("ve-job-started", {
+          detail: { project, id: data.jobId, state: data.state },
+        })
+      );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setApplyError(
@@ -1049,18 +1023,20 @@ export const SubtitlesTab: React.FC<{
           </div>
         </div>
         <button
-          style={applyBtn(pendingCount > 0, applying)}
+          style={applyBtn(pendingCount > 0 && !busy, busy)}
           onClick={applyDrops}
-          disabled={pendingCount === 0 || applying || !project}
+          disabled={pendingCount === 0 || busy || !project}
           title={
             !project
               ? "Project unknown — re-run the pipeline to enable Apply"
-              : pendingCount > 0
-                ? "Re-cut the video, removing the marked cuts/lines"
-                : "Mark a cut or line for deletion to enable"
+              : jobActive
+                ? "A re-cut for this project is running/queued — see its row in the list"
+                : pendingCount > 0
+                  ? "Re-cut the video, removing the marked cuts/lines"
+                  : "Mark a cut or line for deletion to enable"
           }
         >
-          {applying ? "Applying…" : pendingCount > 0 ? `Apply (${pendingCount})` : "Apply"}
+          {jobActive ? "Re-cutting…" : applying ? "Applying…" : pendingCount > 0 ? `Apply (${pendingCount})` : "Apply"}
         </button>
       </div>
       {applyError && (
@@ -1108,12 +1084,6 @@ export const SubtitlesTab: React.FC<{
           </button>
         </div>
       )}
-      {progress > 0 && (
-        <div style={{ height: 3, background: "#1e242a", flexShrink: 0, overflow: "hidden" }}>
-          <div style={{ height: "100%", width: `${progress}%`, background: "#0b84f3", transition: "width 0.2s ease" }} />
-        </div>
-      )}
-
       {hasCaptions ? (
         <div
           style={busy ? { ...list, opacity: 0.5, pointerEvents: "none" } : list}

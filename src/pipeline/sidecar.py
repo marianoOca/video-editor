@@ -12,16 +12,24 @@ Endpoints (CORS-open for localhost Studio on :3000):
     GET  /health          -> {"ok": true}
     GET  /project-health?project=<name>
                           -> probe artifacts; {"ok", "corrupt", "resumeStep", "artifacts"}
+    GET  /project-files?project=<name>
+                          -> shared source/output files (from manifest) for the Delete
+                             modal; {"input":{files,exists}, "output":{files,exists}}
     POST /apply-cuts  body {"project": "<name>", "dropCutIndices": [1, 3]}
-                      -> runs 4_render.py --drop-cuts; {"ok": bool, "log": "..."}
+                      -> persists the edited captions, then ENQUEUES a background
+                         re-cut job (4_render.py --drop-cuts/--drop-ranges); {"jobId"}.
+                         The tab hands off to the sidebar row; the build store hard-
+                         reloads Studio when the recut job finishes.
     POST /fix         body {"project": "<name>"}
                       -> repair a corrupt project: re-run the pipeline from the last
                          valid step through the cut (step 4) as a BACKGROUND JOB,
                          like /rerun-pipeline (so the in-list bar tracks it). {"jobId"}
-    POST /delete-project  body {"project": "<name>"}
+    POST /delete-project  body {"project": "<name>", "deleteInput"?, "deleteOutput"?}
                       -> delete the project entirely (data + snapshot + public +
                          state); {"ok": bool, "removed": [...]}. The patched Studio
-                         native-delete handler POSTs here.
+                         native-delete handler POSTs here. deleteInput/deleteOutput
+                         also unlink the project's source video(s) under input/ and/or
+                         its rendered output(s) (the modal's cleanup options).
     POST /duplicate-project  body {"from": "<src>", "to": "<dst>"}
                       -> copy the project under a new name (all three folders);
                          {"ok": bool, "created": [...]} (409 if <dst> exists).
@@ -35,11 +43,20 @@ Endpoints (CORS-open for localhost Studio on :3000):
     POST /upload-video?filename=<n>  raw body -> stream a dropped video into input/
     POST /import-path     body {"path": "/abs/video.mp4"} -> reference it in place
     POST /run-pipeline    body {"inputs":[...], "project", "overwrite"?}
-                      -> spawn run_all.py 1-6 as a background job; {"jobId"}
+                      -> enqueue run_all.py 1-6 as a background job; {"jobId"}
     POST /rerun-pipeline  body {"project", "fromStep": 2}
-                      -> re-run an existing project from step N (run_all --from N);
-                         {"jobId"}. Step 1 refused if input/ is empty.
-    GET  /pipeline-status -> {"job": null | {state,step,total,label,logTail,error}}
+                      -> enqueue a re-run from step N (run_all --from N); {"jobId"}.
+                         Step 1 rebuilds from the project's manifest sources.
+    POST /dequeue     body {"id": "<jobId>"}
+                      -> cancel a QUEUED job (before it starts) or dismiss a
+                         FINISHED done/error one; 409 if it's currently running.
+    GET  /pipeline-status -> {"jobs": [{id,project,kind,state,step,total,label,
+                              error,queuePos}, ...]}
+
+  Job queue: new / rerun / fix / recut are all appended to ONE FIFO queue drained
+  by a single worker thread — they run one at a time, next-starts-when-current-
+  finishes, in the order added. A project already queued/running rejects a second
+  job for it (409). A failed job flips to "error" and the queue keeps going.
 """
 
 from __future__ import annotations
@@ -51,8 +68,9 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -62,11 +80,11 @@ from urllib.parse import parse_qs, urlparse
 os.environ.setdefault("VE_ALLOW_NO_PROJECT", "1")
 from config import (  # noqa: E402
     SIDECAR_PORT, INPUT_DIR, HYPERFRAMES_PORT, sanitize_project_name,
-    VIDEO_EXTS, list_videos,
+    VIDEO_EXTS, list_videos, read_manifest,
 )
 from remotion_sync import (  # noqa: E402
-    update_snapshot, read_snapshot, delete_project, duplicate_project,
-    rename_project, list_projects,
+    update_snapshot, delete_project, duplicate_project,
+    rename_project, list_projects, project_input_files, project_output_files,
 )
 
 PIPELINE_DIR = Path(__file__).parent
@@ -74,20 +92,25 @@ PROJECT_RE = re.compile(r"^[A-Za-z0-9-]+$")
 
 MAX_UPLOAD_BYTES = 50 * 1024 ** 3  # 50 GB sanity cap (multi-GB videos exist)
 
-# --- Background pipeline job ---
-# Creating a project (run_all.py steps 1-6) takes minutes — far longer than an
-# HTTP request should block. So a "+ New project" run is spawned as a single
-# global background job: the /run-pipeline POST returns immediately, and the
-# Studio modal polls /pipeline-status until done. One job at a time (a second
-# run, or a Subtitles-tab re-cut, is refused with 409 while one is active),
-# which also serializes all writers against the same src/data/<name>/.
-_JOB_LOCK = threading.Lock()
-_JOB: dict | None = None
-# Project a synchronous /apply-cuts is currently re-cutting. Re-cuts run inside
-# the request (not as a job), so without this marker they would be invisible to
-# the busy checks — a delete/rename or a second re-cut could then write the same
-# project concurrently.
-_SYNC_BUSY: str | None = None
+# --- Background pipeline queue ---
+# Heavy pipeline work (new project, re-run, fix, Subtitles-tab re-cut) takes
+# minutes — far longer than an HTTP request should block. Every such action is
+# turned into a JOB and appended to a single FIFO queue; one long-lived worker
+# thread drains it, running exactly ONE job at a time (so all writers against the
+# same src/data/<name>/ stay serialized) and starting the next the moment the
+# current finishes. The POST returns immediately (202 + jobId); the Studio UI
+# polls /pipeline-status and shows per-project progress/queued state in the
+# sidebar. This replaces the old "one slot, else 409" model: nothing is refused
+# for being busy — it queues (dedupe: a project already queued/running is 409).
+#
+# A job dict: {id, project, kind, cmd, state, step, total, label, error,
+#              returncode, finishedAt}. kind ∈ {new, rerun, fix, recut}.
+# state ∈ {queued, running, done, error}.
+_CV = threading.Condition()                       # guards all queue state below
+_QUEUE: deque[dict] = deque()                     # pending jobs, FIFO
+_RUNNING: dict | None = None                      # job currently executing
+_JOBS: "OrderedDict[str, dict]" = OrderedDict()   # every non-evicted job, by id
+_DONE_TTL = 6.0                                    # seconds a finished job lingers
 _TOTAL_STEPS = 6
 # run_all.py prints "▶  <script>" at each step boundary (see its run_step()).
 _STEP_LABELS = {
@@ -109,119 +132,149 @@ def _port_open(port: int, host: str = "127.0.0.1", timeout: float = 0.2) -> bool
         return False
 
 
-def _busy_project() -> str | None:
-    """Project currently being written — by the background job or by a
-    synchronous /apply-cuts re-cut — else None. Mutating endpoints refuse only
-    when their TARGET matches this (deleting project B while A builds is fine);
-    heavy pipeline ops stay globally single-slot via _pipeline_busy()."""
-    with _JOB_LOCK:
-        if _SYNC_BUSY is not None:
-            return _SYNC_BUSY
-        if _JOB is not None and _JOB["state"] == "running":
-            return _JOB["project"]
+def _project_state(project: str) -> str | None:
+    """'running' | 'queued' | None for a project — caller must hold _CV."""
+    for j in _JOBS.values():
+        if j["project"] == project and j["state"] in ("running", "queued"):
+            return j["state"]
     return None
 
 
-def _pipeline_busy() -> bool:
-    return _busy_project() is not None
+def _project_running(project: str) -> bool:
+    with _CV:
+        return any(j["project"] == project and j["state"] == "running"
+                   for j in _JOBS.values())
 
 
-def _claim_sync(project: str) -> bool:
-    """Atomically claim the single work slot for a synchronous re-cut. False if
-    a job or another re-cut is already running (caller answers 409)."""
-    global _SYNC_BUSY
-    with _JOB_LOCK:
-        if _SYNC_BUSY is not None or (_JOB is not None and _JOB["state"] == "running"):
-            return False
-        _SYNC_BUSY = project
-        return True
-
-
-def _release_sync() -> None:
-    global _SYNC_BUSY
-    with _JOB_LOCK:
-        _SYNC_BUSY = None
-
-
-def _has_input_videos() -> bool:
-    """True if input/ holds at least one .mp4/.mov. Gates re-running step 1, which
-    re-normalizes from input/ — pointless (and a hard error) with nothing there."""
-    return bool(list_videos(INPUT_DIR))
-
-
-def _job_snapshot() -> dict | None:
-    """JSON-safe copy of the current job under the lock (deque → list)."""
-    with _JOB_LOCK:
-        if _JOB is None:
-            return None
-        return {
-            "id": _JOB["id"],
-            "project": _JOB["project"],
-            "state": _JOB["state"],
-            "step": _JOB["step"],
-            "total": _JOB["total"],
-            "label": _JOB["label"],
-            "logTail": list(_JOB["logTail"]),
-            "error": _JOB["error"],
-        }
-
-
-def _job_reader(proc: subprocess.Popen, job: dict) -> None:
-    """Daemon thread: stream the run's stdout, advance step/label on each
-    "▶ <script>" boundary, then finalize state from the return code on EOF."""
-    for line in proc.stdout:  # blocking read stays OUTSIDE the lock
-        line = line.rstrip("\n")
-        m = _STEP_RE.match(line)
-        with _JOB_LOCK:
-            job["logTail"].append(line)
-            if m and m.group(1) in _STEP_LABELS:
-                job["step"], job["label"] = _STEP_LABELS[m.group(1)]
-    proc.wait()
-    with _JOB_LOCK:
-        job["returncode"] = proc.returncode
-        if proc.returncode == 0:
-            job["state"], job["step"], job["label"] = "done", _TOTAL_STEPS, "Done"
-        else:
-            job["state"] = "error"
-            job["label"] = "Failed"
-            job["error"] = f"pipeline exited with code {proc.returncode}"
-
-
-def _start_job(cmd: list[str], project: str) -> dict | None:
-    """Spawn the pipeline run for `project` in the background. Returns the job
-    dict, or None if one is already running (caller answers 409)."""
-    global _JOB
-    with _JOB_LOCK:
-        if _SYNC_BUSY is not None or (_JOB is not None and _JOB["state"] == "running"):
+def _enqueue(cmd: list[str], project: str, kind: str,
+             total: int = _TOTAL_STEPS) -> dict | None:
+    """Append a job (dedupe by project). Returns the job, or None if the project
+    already has a queued/running job (caller answers 409)."""
+    with _CV:
+        if _project_state(project) is not None:
             return None
         job = {
             "id": uuid.uuid4().hex[:12],
-            "project": project,
-            "state": "running",
-            "step": 0,
-            "total": _TOTAL_STEPS,
-            "label": "Starting",
-            "logTail": deque(maxlen=24),
-            "error": None,
-            "returncode": None,
+            "project": project, "kind": kind, "cmd": cmd,
+            "state": "queued", "step": 0, "total": total,
+            "label": "Queued", "error": None,
+            "returncode": None, "finishedAt": None,
         }
-        _JOB = job
-    # PYTHONUNBUFFERED so run_all.py's "▶ <step>" boundary markers stream to
-    # _job_reader live. Without it run_all's stdout block-buffers against the pipe
-    # (run_all prints little, so the buffer never fills) and the markers only flush
-    # when it exits — the progress bar then sits at 0 and jumps straight to 100%.
-    # Inherited by the child step subprocesses too, so their output streams as well.
-    env = {**os.environ, "VE_PROJECT": project, "PYTHONUNBUFFERED": "1"}
-    print(f"[sidecar] start job {job['id']} ({project}): {' '.join(cmd)}")
+        _JOBS[job["id"]] = job
+        _QUEUE.append(job)
+        _CV.notify_all()
+        return job
+
+
+def _dequeue(job_id: str) -> tuple[bool, str]:
+    """Remove a QUEUED job (cancel) or a FINISHED done/error job (dismiss).
+    Returns (ok, reason). Refuses a running job."""
+    with _CV:
+        job = _JOBS.get(job_id)
+        if job is None:
+            return False, "not found"
+        if job["state"] == "running":
+            return False, "running"
+        try:
+            _QUEUE.remove(job)
+        except ValueError:
+            pass  # a finished job is no longer in the queue
+        del _JOBS[job_id]
+        return True, "removed"
+
+
+def _cancel_queued_project(project: str) -> list[str]:
+    """Drop a project's pending (queued, not running) job — used by delete/rename
+    so a project with a queued re-run can be removed without waiting."""
+    with _CV:
+        removed = []
+        for j in list(_JOBS.values()):
+            if j["project"] == project and j["state"] == "queued":
+                try:
+                    _QUEUE.remove(j)
+                except ValueError:
+                    pass
+                del _JOBS[j["id"]]
+                removed.append(j["id"])
+        return removed
+
+
+def _status_jobs() -> list[dict]:
+    """Public, JSON-safe view of all jobs (queued in order, running, recently
+    finished). Evicts 'done' jobs older than _DONE_TTL so the list self-clears
+    even if the tab was closed when they finished; 'error' jobs persist until
+    dequeued. Includes queuePos (0-based) for queued jobs."""
+    now = time.monotonic()
+    with _CV:
+        for jid in [j["id"] for j in _JOBS.values()
+                    if j["state"] == "done" and j["finishedAt"] is not None
+                    and now - j["finishedAt"] > _DONE_TTL]:
+            _JOBS.pop(jid, None)
+        qpos = {j["id"]: i for i, j in enumerate(_QUEUE)}
+        return [{
+            "id": j["id"], "project": j["project"], "kind": j["kind"],
+            "state": j["state"], "step": j["step"], "total": j["total"],
+            "label": j["label"], "error": j["error"],
+            "queuePos": qpos.get(j["id"]),
+        } for j in _JOBS.values()]
+
+
+def _run_job(job: dict) -> None:
+    """Run one job to completion, streaming stdout to advance step/label on each
+    run_all "▶ <script>" boundary. A re-cut runs 4_render.py directly (no markers)
+    so it stays step 0 with a 'Re-cutting…' label until it finishes."""
+    # PYTHONUNBUFFERED so run_all's step markers stream live (its stdout would
+    # otherwise block-buffer against the pipe and only flush on exit — bar stuck
+    # at 0 then jumps to 100). Inherited by the child step subprocesses too.
+    env = {**os.environ, "VE_PROJECT": job["project"], "PYTHONUNBUFFERED": "1"}
+    print(f"[sidecar] start job {job['id']} ({job['project']}, {job['kind']}): "
+          f"{' '.join(job['cmd'])}")
+    try:
+        proc = subprocess.Popen(
+            job["cmd"], cwd=PIPELINE_DIR, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, errors="replace", bufsize=1,
+        )
+    except Exception as e:  # spawn failure — never leave the job "running"
+        with _CV:
+            job["state"], job["label"] = "error", "Failed"
+            job["error"], job["finishedAt"] = str(e), time.monotonic()
+        return
     # errors="replace": one undecodable byte in ffmpeg/whisper output would
-    # otherwise kill _job_reader mid-stream and leave the job "running" forever.
-    proc = subprocess.Popen(
-        cmd, cwd=PIPELINE_DIR, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, errors="replace", bufsize=1,
-    )
-    threading.Thread(target=_job_reader, args=(proc, job), daemon=True).start()
-    return job
+    # otherwise kill this reader mid-stream and hang the job "running" forever.
+    for line in proc.stdout:  # blocking read stays OUTSIDE the lock
+        m = _STEP_RE.match(line.rstrip("\n"))
+        if m and m.group(1) in _STEP_LABELS:
+            with _CV:
+                job["step"], job["label"] = _STEP_LABELS[m.group(1)]
+    proc.wait()
+    with _CV:
+        job["returncode"] = proc.returncode
+        job["finishedAt"] = time.monotonic()
+        if proc.returncode == 0:
+            job["state"], job["step"], job["label"] = "done", job["total"], "Done"
+        else:
+            job["state"], job["label"] = "error", "Failed"
+            job["error"] = f"pipeline exited with code {proc.returncode}"
+
+
+def _worker() -> None:
+    """Single daemon thread: wait for a queued job with nothing running, run it,
+    repeat. A failed job just flips to 'error' and the loop continues (the queue
+    keeps going — one bad video never stalls the rest)."""
+    global _RUNNING
+    while True:
+        with _CV:
+            while not _QUEUE or _RUNNING is not None:
+                _CV.wait()
+            job = _QUEUE.popleft()
+            _RUNNING = job
+            job["state"] = "running"
+            job["label"] = "Re-cutting…" if job["kind"] == "recut" else "Starting"
+        _run_job(job)
+        with _CV:
+            _RUNNING = None
+            _CV.notify_all()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -264,31 +317,6 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("invalid project name")
         return src, dst
 
-    def _run_and_respond(self, cmd: list[str], project: str,
-                         extra_on_success=None) -> None:
-        """Run a pipeline command for `project` (VE_PROJECT in env, cwd=pipeline)
-        and write the JSON response: {ok, log} on completion. No timeout — re-cuts
-        and re-transcribes scale with video length, so a half-hour video must run to
-        completion rather than be killed mid-edit. On success, merge
-        extra_on_success() (a callable, evaluated post-run) into the payload — used
-        to return the freshly written snapshot captions."""
-        env = {**os.environ, "VE_PROJECT": project}
-        print(f"[sidecar] {project}: {' '.join(cmd)}")
-        proc = subprocess.run(
-            cmd, cwd=PIPELINE_DIR, env=env,
-            capture_output=True, text=True,
-        )
-        log = ((proc.stdout or "") + (proc.stderr or "")).strip()
-        tail = "\n".join(log.splitlines()[-12:])
-        ok = proc.returncode == 0
-        payload = {"ok": ok, "log": tail}
-        if ok and extra_on_success:
-            try:
-                payload.update(extra_on_success())
-            except Exception:
-                pass  # never let a post-run readback fail the response
-        self._json(200 if ok else 500, payload)
-
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
@@ -299,7 +327,10 @@ class Handler(BaseHTTPRequestHandler):
             self._input_videos()
             return
         if path == "/pipeline-status":
-            self._json(200, {"ok": True, "job": _job_snapshot()})
+            self._json(200, {"ok": True, "jobs": _status_jobs()})
+            return
+        if path == "/project-files":
+            self._project_files(parse_qs(parsed.query).get("project", [""])[0])
             return
         if path == "/project-health":
             project = (parse_qs(parsed.query).get("project", [""])[0]).strip()
@@ -338,6 +369,8 @@ class Handler(BaseHTTPRequestHandler):
             self._run_pipeline()
         elif path == "/rerun-pipeline":
             self._rerun_pipeline()
+        elif path == "/dequeue":
+            self._dequeue_job()
         else:
             self._json(404, {"ok": False, "error": "not found"})
 
@@ -367,31 +400,30 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"ok": False, "error": str(e)})
             return
 
-        # Hold the single work slot for the whole synchronous re-cut so a second
-        # Apply, a pipeline job, or a same-project delete/rename can't run
-        # concurrently against the files being rewritten.
-        if not _claim_sync(project):
-            self._json(409, {"ok": False, "error": "a pipeline run is already active"})
-            return
-        try:
-            # Persist the tab's current (edited) captions before re-cutting so
-            # 4_render re-maps THEM through the cut — preserving manual edits/splits.
-            self._persist_captions(project, data.get("captions"))
+        # Persist the tab's current (edited) captions BEFORE enqueuing so the
+        # re-cut job's 4_render re-maps THEM through the cut (manual edits/splits
+        # survive). Done synchronously here so it's on disk before the worker can
+        # pick the job up. Best-effort: a missing snapshot is swallowed.
+        self._persist_captions(project, data.get("captions"))
 
-            cmd = [sys.executable, "4_render.py"]
-            if drop:
-                cmd += ["--drop-cuts", ",".join(str(i) for i in drop)]
-            if ranges:
-                cmd += ["--drop-ranges", ",".join(f"{s:.0f}-{e:.0f}" for s, e in ranges)]
-            # Return the re-mapped captions so the tab can resync its Studio store to
-            # the new (shorter) timeline — otherwise the pre-cut caption override
-            # survives HMR and shadows the snapshot, desyncing captions from the video.
-            self._run_and_respond(
-                cmd, project,
-                extra_on_success=lambda: {"captions": (read_snapshot(project) or {}).get("captions", [])},
-            )
-        finally:
-            _release_sync()
+        cmd = [sys.executable, "4_render.py"]
+        if drop:
+            cmd += ["--drop-cuts", ",".join(str(i) for i in drop)]
+        if ranges:
+            cmd += ["--drop-ranges", ",".join(f"{s:.0f}-{e:.0f}" for s, e in ranges)]
+        # Enqueue as a background job (kind=recut) instead of blocking the request.
+        # total=1: 4_render emits no run_all "▶" step markers, so the bar is
+        # indeterminate until done. The tab hands off to the sidebar row; on job
+        # completion the build store hard-reloads to pick up the re-mapped snapshot
+        # (dropping the in-memory caption override). 409 if this project already has
+        # a queued/running job.
+        job = _enqueue(cmd, project, "recut", total=1)
+        if job is None:
+            self._json(409, {"ok": False,
+                             "error": "this project already has a job queued or running"})
+            return
+        self._json(202, {"ok": True, "jobId": job["id"], "project": project,
+                         "state": job["state"]})
 
     def _save_captions(self) -> None:
         """Persist edited captions to the snapshot (debounced auto-save from the
@@ -406,7 +438,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, json.JSONDecodeError) as e:
             self._json(400, {"ok": False, "error": str(e)})
             return
-        if _busy_project() == project:
+        if _project_running(project):
             self._json(409, {"ok": False,
                              "error": "project has a run in progress; save skipped"})
             return
@@ -435,11 +467,6 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"ok": False, "error": str(e)})
             return
 
-        if _pipeline_busy():
-            self._json(409, {"ok": False, "error": "a pipeline run is already active",
-                             "job": _job_snapshot()})
-            return
-
         from health import probe_project
         step = probe_project(project)["resumeStep"]
         # Healthy (or unknown) → re-cut from step 4 anyway: cheap and idempotent.
@@ -448,30 +475,82 @@ class Handler(BaseHTTPRequestHandler):
 
         cmd = [sys.executable, "run_all.py",
                "--from", str(step), "--until", "4", "--no-open", "--project", project]
-        job = _start_job(cmd, project)
-        if job is None:  # lost a race for the single slot
-            self._json(409, {"ok": False, "error": "a pipeline run is already active",
-                             "job": _job_snapshot()})
+        job = _enqueue(cmd, project, "fix")
+        if job is None:  # this project already has a queued/running job
+            self._json(409, {"ok": False,
+                             "error": "this project already has a job queued or running"})
             return
-        self._json(202, {"ok": True, "jobId": job["id"], "project": project})
+        self._json(202, {"ok": True, "jobId": job["id"], "project": project,
+                         "state": job["state"]})
+
+    def _dequeue_job(self) -> None:
+        """Cancel a QUEUED job (before it starts) or dismiss a FINISHED done/error
+        job. Refuses a running job (can't cancel a live pipeline). The queued-row
+        ✕ and the build store's recut-done cleanup both POST here."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(length) or b"{}")
+            job_id = str(data.get("id", ""))
+            if not job_id:
+                raise ValueError("id required")
+        except (ValueError, json.JSONDecodeError) as e:
+            self._json(400, {"ok": False, "error": str(e)})
+            return
+        ok, reason = _dequeue(job_id)
+        if ok:
+            self._json(200, {"ok": True, "removed": [job_id]})
+        elif reason == "running":
+            self._json(409, {"ok": False, "error": "job is running; can't cancel"})
+        else:
+            self._json(404, {"ok": False, "error": reason})
+
+    def _project_files(self, project: str) -> None:
+        """Report a project's SHARED source + rendered files (from the manifest), so
+        the Delete modal can enable/disable its cleanup options. GET, read-only.
+        Returns basenames + an `exists` flag for each of input/output."""
+        project = (project or "").strip()
+        if not PROJECT_RE.match(project):
+            self._json(400, {"ok": False, "error": "invalid project name"})
+            return
+        try:
+            inputs = project_input_files(project)
+            outputs = project_output_files(project)
+        except FileNotFoundError as e:  # manifest missing — invariant break
+            self._json(404, {"ok": False, "error": str(e)})
+            return
+        except Exception as e:
+            self._json(500, {"ok": False, "error": str(e)})
+            return
+        self._json(200, {
+            "ok": True,
+            "input": {"files": [p.name for p in inputs], "exists": bool(inputs)},
+            "output": {"files": [p.name for p in outputs], "exists": bool(outputs)},
+        })
 
     def _delete_project(self) -> None:
         """Delete a project entirely: data dir + Remotion snapshot + public assets,
         clearing active-project state. The patched Studio delete handler POSTs here
         (Root.tsx discovers projects via require.context, so the composition drops
-        from the sidebar on the next recompile)."""
+        from the sidebar on the next recompile). Optional {deleteInput, deleteOutput}
+        also remove the project's source video(s) under input/ and/or its rendered
+        output(s) — the modal's three cleanup choices."""
         try:
-            project, _ = self._read_project()
+            project, data = self._read_project()
         except (ValueError, TypeError, json.JSONDecodeError) as e:
             self._json(400, {"ok": False, "error": str(e)})
             return
-        # Only refuse when THIS project is being written (a job or a re-cut);
-        # deleting a different project during a run is safe and allowed.
-        if _busy_project() == project:
+        del_input = bool(data.get("deleteInput"))
+        del_output = bool(data.get("deleteOutput"))
+        # A RUNNING project can't be deleted (files are being written); a QUEUED
+        # one is fine — cancel its pending job first, then delete. Deleting a
+        # different project during a run is always allowed.
+        if _project_running(project):
             self._json(409, {"ok": False, "error": "project has a run in progress"})
             return
+        _cancel_queued_project(project)
         try:
-            removed = delete_project(project)
+            removed = delete_project(project, delete_input=del_input,
+                                     delete_output=del_output)
         except Exception as e:  # never crash the caller
             self._json(500, {"ok": False, "error": str(e)})
             return
@@ -488,9 +567,11 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, json.JSONDecodeError) as e:
             self._json(400, {"ok": False, "error": str(e)})
             return
-        if _busy_project() in (src, dst):
+        if _project_running(src) or _project_running(dst):
             self._json(409, {"ok": False, "error": "project has a run in progress"})
             return
+        _cancel_queued_project(src)
+        _cancel_queued_project(dst)
         try:
             created = duplicate_project(src, dst)
         except FileExistsError as e:
@@ -511,9 +592,11 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, json.JSONDecodeError) as e:
             self._json(400, {"ok": False, "error": str(e)})
             return
-        if _busy_project() in (src, dst):
+        if _project_running(src) or _project_running(dst):
             self._json(409, {"ok": False, "error": "project has a run in progress"})
             return
+        _cancel_queued_project(src)
+        _cancel_queued_project(dst)
         try:
             moved = rename_project(src, dst)
         except FileExistsError as e:
@@ -631,10 +714,6 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"ok": False, "error": str(e)})
             return
 
-        if _pipeline_busy():
-            self._json(409, {"ok": False, "error": "a pipeline run is already active",
-                             "job": _job_snapshot()})
-            return
         if not overwrite and project in list_projects():
             self._json(409, {"ok": False, "error": "project exists", "project": project})
             return
@@ -642,20 +721,23 @@ class Handler(BaseHTTPRequestHandler):
         cmd = [sys.executable, "run_all.py",
                "--from", "1", "--until", "6", "--no-open",
                "--project", project, "--input", *inputs]
-        job = _start_job(cmd, project)
-        if job is None:  # lost a race for the single slot
-            self._json(409, {"ok": False, "error": "a pipeline run is already active",
-                             "job": _job_snapshot()})
+        job = _enqueue(cmd, project, "new")
+        if job is None:  # this project already has a queued/running job
+            self._json(409, {"ok": False,
+                             "error": "this project already has a job queued or running"})
             return
-        self._json(202, {"ok": True, "jobId": job["id"], "project": project})
+        self._json(202, {"ok": True, "jobId": job["id"], "project": project,
+                         "state": job["state"]})
 
     def _rerun_pipeline(self) -> None:
         """Re-run the pipeline for an EXISTING project from a chosen step
         (run_all.py --from N --project <name>, running through step 6). Unlike
         /run-pipeline this does NOT refuse an existing project — re-running one is
         the whole point. --project wins over the input-stem fallback in run_all, so
-        the named project is always the target. Step 1 re-normalizes from input/,
-        so it's refused when input/ is empty (the UI also greys it out)."""
+        the named project is always the target. Step 1 must rebuild from the project's
+        ORIGINAL sources (from the manifest), NOT from whatever currently sits in the
+        shared input/ folder — so from_step==1 passes the manifest inputs explicitly
+        as --input, and is refused if any source is missing."""
         try:
             length = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(length) or b"{}")
@@ -669,35 +751,51 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"ok": False, "error": str(e)})
             return
 
-        if from_step == 1 and not _has_input_videos():
-            self._json(400, {"ok": False, "error": "step 1 needs a video in input/"})
-            return
-
-        if _pipeline_busy():
-            self._json(409, {"ok": False, "error": "a pipeline run is already active",
-                             "job": _job_snapshot()})
-            return
+        # from_step==1 re-normalizes: feed the project's own source videos (the
+        # manifest records every one, incl. external paths), not the shared input/
+        # glob — otherwise a multi-video project gets rebuilt from the wrong set.
+        step1_inputs: list[str] = []
+        if from_step == 1:
+            try:
+                manifest_inputs = read_manifest(project).get("inputs", [])
+            except FileNotFoundError as e:
+                self._json(400, {"ok": False, "error": str(e)})
+                return
+            missing = [p for p in manifest_inputs if not Path(p).exists()]
+            if not manifest_inputs or missing:
+                self._json(400, {"ok": False, "error":
+                                 "step 1 needs the project's source video(s); "
+                                 f"missing/none: {missing or 'no sources recorded'}"})
+                return
+            step1_inputs = manifest_inputs
 
         cmd = [sys.executable, "run_all.py",
                "--from", str(from_step), "--no-open", "--project", project]
-        job = _start_job(cmd, project)
-        if job is None:  # lost a race for the single slot
-            self._json(409, {"ok": False, "error": "a pipeline run is already active",
-                             "job": _job_snapshot()})
+        if step1_inputs:
+            cmd += ["--input", *step1_inputs]
+        job = _enqueue(cmd, project, "rerun")
+        if job is None:  # this project already has a queued/running job
+            self._json(409, {"ok": False,
+                             "error": "this project already has a job queued or running"})
             return
-        self._json(202, {"ok": True, "jobId": job["id"], "project": project})
+        self._json(202, {"ok": True, "jobId": job["id"], "project": project,
+                         "state": job["state"]})
 
     def log_message(self, *args) -> None:  # quiet default request logging
         pass
 
 
 def main() -> None:
+    # Single daemon worker drains the job queue (new / rerun / fix / recut), one
+    # at a time, starting the next as soon as the current finishes.
+    threading.Thread(target=_worker, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", SIDECAR_PORT), Handler)
     print(f"sidecar listening on http://127.0.0.1:{SIDECAR_PORT}\n"
           f"  POST /apply-cuts /fix /delete-project /save-captions\n"
-          f"  POST /duplicate-project /rename-project\n"
+          f"  POST /duplicate-project /rename-project /dequeue\n"
           f"  POST /upload-video /import-path /run-pipeline /rerun-pipeline\n"
-          f"  GET  /health /project-health /input-videos /pipeline-status\n"
+          f"  GET  /health /project-health /input-videos /pipeline-status /project-files\n"
+          f"queue: heavy jobs run one at a time via a FIFO worker\n"
           f"Ctrl+C to stop")
     try:
         server.serve_forever()

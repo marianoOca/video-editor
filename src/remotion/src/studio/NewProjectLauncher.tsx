@@ -170,30 +170,40 @@ function uploadFile(file: File, onProgress: (pct: number) => void): Promise<stri
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
- * Build store — a module-level singleton tracking the one in-flight pipeline run.
- * NewProjectLauncher writes it (start) and polls the sidecar; the patched Studio
- * components subscribe to it. Lives outside React so it survives the modal closing
- * and component remounts.
+ * Build store — a module-level singleton mirroring the sidecar's job QUEUE. Keyed
+ * by project (a project has at most one active job — dedupe is enforced server-
+ * side), so every project row can look up its own build. The sidecar is the source
+ * of truth: this store just polls /pipeline-status and reflects the `jobs` list.
+ * Lives outside React so it survives the modal closing and component remounts.
+ *
+ * Jobs come from ALL heavy actions — new project, re-run, fix, and Subtitles-tab
+ * re-cut — which the sidecar runs one at a time via a FIFO worker. So a project row
+ * can show "Queued · Nth in line" (with an ✕ to cancel), a running progress bar, a
+ * brief "Ready", or an error (with ✕ to dismiss).
  * ──────────────────────────────────────────────────────────────────────────── */
 
-type BuildState = "running" | "done" | "error";
+type BuildState = "queued" | "running" | "done" | "error";
 type Build = {
+  id: string;
   project: string;
+  kind?: string; // new | rerun | fix | recut
   state: BuildState;
   step: number;
   total: number;
   label: string;
   error: string | null;
+  queuePos: number | null; // 0-based position among QUEUED jobs
 };
 
-let _build: Build | null = null;
+// Immutable map so useSyncExternalStore's getSnapshot stays referentially stable.
+let _builds: Record<string, Build> = {};
 const _subs = new Set<() => void>();
 let _poll: ReturnType<typeof setInterval> | null = null;
 let _inited = false;
 
 const _emit = () => _subs.forEach((f) => f());
-const _set = (b: Build | null) => {
-  _build = b;
+const _setBuilds = (next: Record<string, Build>) => {
+  _builds = next;
   _emit();
 };
 
@@ -204,42 +214,77 @@ const _stopPoll = () => {
   }
 };
 
-const _fromJob = (j: any): Build => ({
-  project: j.project,
-  state: j.state,
-  step: j.step,
-  total: j.total,
-  label: j.label || "Working",
-  error: j.error ?? null,
-});
+const _fromJobs = (jobs: any[]): Record<string, Build> => {
+  const next: Record<string, Build> = {};
+  for (const j of jobs) {
+    next[j.project] = {
+      id: j.id,
+      project: j.project,
+      kind: j.kind,
+      state: j.state,
+      step: j.step ?? 0,
+      total: j.total ?? 6,
+      label: j.label || "Working",
+      error: j.error ?? null,
+      queuePos: j.queuePos ?? null,
+    };
+  }
+  return next;
+};
 
 const _beginPoll = () => {
   _stopPoll();
   _poll = setInterval(async () => {
     const { ok, body } = await fetchJSON("/pipeline-status");
-    if (!ok || !body.job) return;
-    const j = body.job;
-    _set(_fromJob(j));
-    if (j.state === "done") {
+    if (!ok || !Array.isArray(body.jobs)) return;
+    // A finished re-cut swapped edited.mp4 in place and rewrote the snapshot; a
+    // hard reload picks up the re-mapped captions AND drops the in-memory
+    // (shouldSave:false) caption override that would otherwise shadow them. Dequeue
+    // it first so the reloaded page doesn't see it done again and reload-loop.
+    const recutDone = body.jobs.find((j: any) => j.kind === "recut" && j.state === "done");
+    if (recutDone) {
       _stopPoll();
-      // Brief 100% beat, then hand off to the now-real (clickable) composition row.
-      setTimeout(() => {
-        if (_build && _build.project === j.project) _set(null);
-      }, 800);
-    } else if (j.state === "error") {
-      _stopPoll();
+      await fetchJSON("/dequeue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: recutDone.id }),
+      });
+      window.location.reload();
+      return;
     }
+    _setBuilds(_fromJobs(body.jobs));
+    if (body.jobs.length === 0) _stopPoll();
   }, 1000);
 };
 
 export const buildStore = {
-  start(project: string) {
-    _set({ project, state: "running", step: 0, total: 6, label: "Starting", error: null });
+  // Seed one build optimistically (so the row shows without a 1s poll lag) and
+  // ensure polling is on. The poll reconciles to the server's truth immediately.
+  startOrQueue(detail: { project: string; id?: string; state?: string }) {
+    const state = (detail.state as BuildState) || "queued";
+    const b: Build = {
+      id: detail.id || `pending-${detail.project}`,
+      project: detail.project,
+      state,
+      step: 0,
+      total: 6,
+      label: state === "running" ? "Starting" : "Queued",
+      error: null,
+      queuePos: null,
+    };
+    _setBuilds({ ..._builds, [detail.project]: b });
     _beginPoll();
   },
-  dismiss() {
-    _stopPoll();
-    _set(null);
+  // Cancel a queued job / dismiss a finished one (server drops it; optimistic here).
+  dequeue(id: string) {
+    fetchJSON("/dequeue", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    }).catch(() => {});
+    const next: Record<string, Build> = {};
+    for (const [k, v] of Object.entries(_builds)) if (v.id !== id) next[k] = v;
+    _setBuilds(next);
   },
   subscribe(cb: () => void) {
     _subs.add(cb);
@@ -247,80 +292,152 @@ export const buildStore = {
       _subs.delete(cb);
     };
   },
-  get(): Build | null {
-    return _build;
+  get(): Record<string, Build> {
+    return _builds;
   },
-  // Re-attach to a run already in flight (e.g. after a page reload mid-build).
+  // Re-attach to jobs already in flight (e.g. after a page reload mid-build).
   initOnce() {
     if (_inited) return;
     _inited = true;
     (async () => {
       const { ok, body } = await fetchJSON("/pipeline-status");
-      if (ok && body.job && body.job.state === "running") {
-        _set(_fromJob(body.job));
+      if (ok && Array.isArray(body.jobs) && body.jobs.length) {
+        _setBuilds(_fromJobs(body.jobs));
         _beginPoll();
       }
     })();
   },
 };
 
-// A project is blocked from selection only while actively running (clickable again
-// once done/error). Plain function so the patched onClick can call it at click time.
-export const isBuildBlocked = (compositionId: string): boolean =>
-  _build !== null && _build.state === "running" && _build.project === compositionId;
+// A project is blocked from selection only while its job is actively RUNNING
+// (queued/done/error stay clickable — a queued project isn't being written yet, so
+// its old cut still plays). Plain function so the patched onClick can call it.
+export const isBuildBlocked = (compositionId: string): boolean => {
+  const b = _builds[compositionId];
+  return !!b && b.state === "running";
+};
 
-const useBuild = (): Build | null =>
+const useBuilds = (): Record<string, Build> =>
   React.useSyncExternalStore(buildStore.subscribe, buildStore.get, buildStore.get);
+
+// Per-project build (for a composition row or the Subtitles tab's edit-lock).
+export const useProjectBuild = (project: string | null): Build | null => {
+  const builds = useBuilds();
+  return project ? builds[project] ?? null : null;
+};
 
 /* ──────────────────────────── shared visuals ─────────────────────────────── */
 
+// A re-cut runs 4_render.py directly (no run_all step markers), so it has no
+// determinate progress — show a sliding indeterminate bar. Keyframes injected once.
+const ensureIndetStyle = () => {
+  const ID = "ve-indet-style";
+  if (typeof document === "undefined" || document.getElementById(ID)) return;
+  const s = document.createElement("style");
+  s.id = ID;
+  s.textContent = "@keyframes ve-indet{0%{left:-40%}100%{left:100%}}";
+  document.head.appendChild(s);
+};
+
+const isIndeterminate = (build: Build): boolean =>
+  build.state === "running" && (build.kind === "recut" || build.total <= 1);
+
 const ProgressBar: React.FC<{ build: Build }> = ({ build }) => {
+  ensureIndetStyle();
+  const indet = isIndeterminate(build);
   const pct = build.state === "done" ? 100 : build.total ? Math.round((build.step / build.total) * 100) : 0;
   return (
-    <div style={{ height: 4, borderRadius: 2, background: "rgba(255,255,255,0.12)", overflow: "hidden" }}>
-      <div
-        style={{
-          width: `${pct}%`,
-          height: "100%",
-          borderRadius: 2,
-          background: build.state === "error" ? "#ff6b6b" : ACCENT,
-          transition: "width 300ms",
-        }}
-      />
+    <div style={{ position: "relative", height: 4, borderRadius: 2, background: "rgba(255,255,255,0.12)", overflow: "hidden" }}>
+      {indet ? (
+        <div
+          style={{
+            position: "absolute",
+            top: 0,
+            width: "40%",
+            height: "100%",
+            borderRadius: 2,
+            background: ACCENT,
+            animation: "ve-indet 1.1s linear infinite",
+          }}
+        />
+      ) : (
+        <div
+          style={{
+            width: `${pct}%`,
+            height: "100%",
+            borderRadius: 2,
+            background: build.state === "error" ? "#ff6b6b" : ACCENT,
+            transition: "width 300ms",
+          }}
+        />
+      )}
     </div>
   );
 };
 
-const buildCaption = (build: Build): string =>
-  build.state === "done" ? "Ready" : `${build.label} · ${build.step}/${build.total}`;
+const ordinal = (n: number): string => {
+  const s = ["th", "st", "nd", "rd"];
+  const v = n % 100;
+  return `${n}${s[(v - 20) % 10] || s[v] || s[0]}`;
+};
+
+const buildCaption = (build: Build): string => {
+  if (build.state === "done") return "Ready";
+  if (build.state === "queued") {
+    return build.queuePos != null ? `Queued · ${ordinal(build.queuePos + 1)} in line` : "Queued";
+  }
+  if (isIndeterminate(build)) return build.label; // e.g. "Re-cutting…"
+  return `${build.label} · ${build.step}/${build.total}`;
+};
+
+// Bar/caption body shared by CompositionBuildBar (existing project rows) and
+// SyntheticBuildRow (new-project rows with no composition yet).
+const BuildRowBody: React.FC<{ build: Build }> = ({ build }) => {
+  if (build.state === "error") {
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <span style={{ color: "#ff6b6b", fontSize: 10, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {build.error || "failed"}
+        </span>
+        <button onClick={() => buildStore.dequeue(build.id)} style={{ ...btn(false), padding: "0 6px", fontSize: 11 }} aria-label="Dismiss">
+          ✕
+        </button>
+      </div>
+    );
+  }
+  if (build.state === "queued") {
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <span style={{ color: MUTED, fontSize: 10, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {buildCaption(build)}
+        </span>
+        <button onClick={() => buildStore.dequeue(build.id)} style={{ ...btn(false), padding: "0 6px", fontSize: 11 }} aria-label="Cancel">
+          ✕
+        </button>
+      </div>
+    );
+  }
+  return (
+    <>
+      <ProgressBar build={build} />
+      <div style={{ fontSize: 9, color: MUTED, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        {buildCaption(build)}
+      </div>
+    </>
+  );
+};
 
 /* ───────────── pieces injected into the patched Studio components ──────────── */
 
 // Rendered under the matching REAL composition row (patched into CompositionSelectorItem.js).
 export const CompositionBuildBar: React.FC<{ compositionId: string; level: number }> = ({ compositionId, level }) => {
-  const build = useBuild();
-  if (!build || build.project !== compositionId) return null;
+  const build = useProjectBuild(compositionId);
+  if (!build) return null;
   // Align under the row's name (paddingLeft 12 + level*8 + icon 18 + spacing 8).
   const padLeft = 38 + level * 8;
   return (
     <div style={{ padding: `2px 12px 7px ${padLeft}px`, background: PANEL_BG, fontFamily: "Arial, Helvetica, sans-serif" }}>
-      {build.state === "error" ? (
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <span style={{ color: "#ff6b6b", fontSize: 10, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {build.error || "failed"}
-          </span>
-          <button onClick={() => buildStore.dismiss()} style={{ ...btn(false), padding: "0 6px", fontSize: 11 }} aria-label="Dismiss">
-            ✕
-          </button>
-        </div>
-      ) : (
-        <>
-          <ProgressBar build={build} />
-          <div style={{ fontSize: 9, color: MUTED, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {buildCaption(build)}
-          </div>
-        </>
-      )}
+      <BuildRowBody build={build} />
     </div>
   );
 };
@@ -351,18 +468,8 @@ const FilmIcon: React.FC<{ color: string }> = ({ color }) => (
 //   • at the top of the list as a `fallback` (CompositionSelector.js) — only used
 //     when there is NO Projects folder yet (the very first project ever), so the row
 //     never vanishes. The two never both render: fallback bails if the folder exists.
-export const SyntheticBuildRow: React.FC<{ level?: number; fallback?: boolean }> = ({
-  level = 1,
-  fallback = false,
-}) => {
-  const build = useBuild();
-  const cm = React.useContext((Internals as any).CompositionManager) as any;
-  if (!build) return null;
-  const exists = (cm?.compositions || []).some((c: any) => c.id === build.project);
-  if (exists) return null; // the real row carries the bar from here on
-  // The Projects-folder copy owns this row; the top-level fallback yields to it.
-  if (fallback && (cm?.folders || []).some((f: any) => f.name === PROJECTS_FOLDER)) return null;
-  const error = build.state === "error";
+// One stand-in row for a single build whose composition doesn't exist yet.
+const SyntheticRow: React.FC<{ build: Build; level: number }> = ({ build, level }) => {
   // Row indent matches a native row (itemStyle paddingLeft = 12 + level*8); the bar
   // sits under the name (+ icon 18 + gap 8), same formula as CompositionBuildBar.
   const rowPadLeft = 12 + level * 8;
@@ -398,28 +505,42 @@ export const SyntheticBuildRow: React.FC<{ level?: number; fallback?: boolean }>
         >
           {build.project}
         </span>
-        {error ? (
-          <button onClick={() => buildStore.dismiss()} style={{ ...btn(false), padding: "0 6px", fontSize: 11 }} aria-label="Dismiss">
-            ✕
-          </button>
-        ) : null}
       </div>
-      {/* progress bar under the name — identical layout to CompositionBuildBar */}
+      {/* progress/queued/error body under the name — same layout as CompositionBuildBar */}
       <div style={{ padding: `2px 12px 7px ${barPadLeft}px`, background: PANEL_BG }}>
-        {error ? (
-          <div style={{ color: "#ff6b6b", fontSize: 10, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {build.error || "failed"}
-          </div>
-        ) : (
-          <>
-            <ProgressBar build={build} />
-            <div style={{ fontSize: 9, color: MUTED, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {buildCaption(build)}
-            </div>
-          </>
-        )}
+        <BuildRowBody build={build} />
       </div>
     </div>
+  );
+};
+
+// Stand-in rows shown while a build's composition snapshot doesn't exist yet
+// (a brand-new project during steps 1-3, or one still queued). Each mirrors a
+// native CompositionSelectorItem row (32px, indent, film icon, 13px) with the
+// build body underneath. Re-runs/fixes/re-cuts target EXISTING projects (real
+// rows → CompositionBuildBar), so only new-project builds ever appear here — but
+// several may be queued at once, so we render one row per orphan build. Mounted twice:
+//   • inside the Projects folder body (CompositionSelectorItem.js, level = folder+1)
+//   • at the top of the list as a `fallback` (CompositionSelector.js) — used only
+//     when there is NO Projects folder yet. The two never both render: the fallback
+//     yields if the folder exists.
+export const SyntheticBuildRow: React.FC<{ level?: number; fallback?: boolean }> = ({
+  level = 1,
+  fallback = false,
+}) => {
+  const builds = useBuilds();
+  const cm = React.useContext((Internals as any).CompositionManager) as any;
+  const compIds = new Set((cm?.compositions || []).map((c: any) => c.id));
+  const orphans = Object.values(builds).filter((b) => !compIds.has(b.project));
+  if (orphans.length === 0) return null;
+  // The Projects-folder copy owns these rows; the top-level fallback yields to it.
+  if (fallback && (cm?.folders || []).some((f: any) => f.name === PROJECTS_FOLDER)) return null;
+  return (
+    <>
+      {orphans.map((b) => (
+        <SyntheticRow key={b.project} build={b} level={level} />
+      ))}
+    </>
   );
 };
 
@@ -449,9 +570,8 @@ type Phase = "idle" | "uploading";
 
 const Modal: React.FC<{
   onClose: () => void;
-  onStarted: (project: string) => void;
-  jobRunning: boolean;
-}> = ({ onClose, onStarted, jobRunning }) => {
+  onStarted: (detail: { project: string; id?: string; state?: string }) => void;
+}> = ({ onClose, onStarted }) => {
   const [videos, setVideos] = useState<InputVideo[]>([]);
   const [projects, setProjects] = useState<string[]>([]);
   const [externals, setExternals] = useState<External[]>([]);
@@ -596,7 +716,7 @@ const Modal: React.FC<{
   }, [pathInput]);
 
   const create = useCallback(async () => {
-    if (!checkedItems.length || !projectName || (collision && !overwrite) || jobRunning) return;
+    if (!checkedItems.length || !projectName || (collision && !overwrite)) return;
     setError(null);
     const inputs = checkedItems.map((i) => i.send);
     const { ok, status, body } = await fetchJSON("/run-pipeline", {
@@ -609,15 +729,17 @@ const Modal: React.FC<{
         await loadList();
         setError("Project already exists — rename or tick Overwrite.");
       } else if (status === 409) {
-        setError("A project is already being created — wait for it to finish.");
+        // A same-named project already has a job queued/running (dedupe).
+        setError(body.error || "This project already has a job queued or running.");
       } else {
         setError(body.error || `request failed (${status})`);
       }
       return;
     }
-    // Hand the run off to the build store (it shows in the list) and get out of the way.
-    onStarted(body.project);
-  }, [checkedItems, projectName, collision, overwrite, jobRunning, loadList, onStarted]);
+    // Hand the run off to the build store — it queues behind any running jobs and
+    // shows its progress/queued state in the list. Get out of the way.
+    onStarted({ project: body.project, id: body.jobId, state: body.state });
+  }, [checkedItems, projectName, collision, overwrite, loadList, onStarted]);
 
   const onKeyDown = (e: React.KeyboardEvent) => {
     // Keep keystrokes inside the modal — Studio binds global shortcuts.
@@ -626,7 +748,7 @@ const Modal: React.FC<{
   };
 
   const createDisabled =
-    busy || jobRunning || !checkedItems.length || !projectName || (collision && !overwrite);
+    busy || !checkedItems.length || !projectName || (collision && !overwrite);
 
   return (
     <div style={overlayStyle} onClick={() => !busy && onClose()}>
@@ -780,11 +902,6 @@ const Modal: React.FC<{
         {phase === "uploading" ? (
           <div style={{ marginTop: 16, color: MUTED }}>{uploadMsg}</div>
         ) : null}
-        {jobRunning ? (
-          <div style={{ marginTop: 16, color: MUTED, fontSize: 12 }}>
-            A project is being created — wait for it to finish before starting another.
-          </div>
-        ) : null}
         {error ? (
           <div style={{ marginTop: 12, color: "#ff6b6b", fontSize: 12 }}>{error}</div>
         ) : null}
@@ -805,24 +922,23 @@ const Modal: React.FC<{
 
 export const NewProjectLauncher: React.FC = () => {
   const [open, setOpen] = useState(false);
-  const build = useBuild();
 
-  // Re-attach to a run already in flight (survives reloads / first mount), and
-  // adopt runs kicked off elsewhere — RerunLauncher dispatches `ve-job-started`
-  // after POSTing /rerun-pipeline, so reruns also light up the in-list progress
-  // bar + selection block + deselect.
+  // Re-attach to jobs already in flight (survives reloads / first mount), and
+  // adopt jobs kicked off elsewhere — RerunLauncher (re-run) and SubtitlesTab
+  // (fix, re-cut) dispatch `ve-job-started` after their POST, so those also light
+  // up the in-list progress/queued bar + selection block.
   useEffect(() => {
     buildStore.initOnce();
     const onJobStarted = (e: Event) => {
       const d = (e as CustomEvent).detail;
-      if (d && typeof d.project === "string") buildStore.start(d.project);
+      if (d && typeof d.project === "string") buildStore.startOrQueue(d);
     };
     window.addEventListener("ve-job-started", onJobStarted);
     return () => window.removeEventListener("ve-job-started", onJobStarted);
   }, []);
 
-  const onStarted = useCallback((project: string) => {
-    buildStore.start(project);
+  const onStarted = useCallback((detail: { project: string; id?: string; state?: string }) => {
+    buildStore.startOrQueue(detail);
     setOpen(false);
   }, []);
 
@@ -831,9 +947,7 @@ export const NewProjectLauncher: React.FC = () => {
       <button style={triggerStyle} onClick={() => setOpen(true)}>
         + New project
       </button>
-      {open ? (
-        <Modal onClose={() => setOpen(false)} onStarted={onStarted} jobRunning={build?.state === "running"} />
-      ) : null}
+      {open ? <Modal onClose={() => setOpen(false)} onStarted={onStarted} /> : null}
     </>
   );
 };

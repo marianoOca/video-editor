@@ -21,7 +21,7 @@ import os
 import shutil
 from pathlib import Path
 
-from config import REMOTION_DIR, DATA_ROOT, STATE_FILE
+from config import REMOTION_DIR, DATA_ROOT, STATE_FILE, INPUT_DIR, read_manifest
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -231,14 +231,53 @@ def regenerate_root(remotion_dir: Path = REMOTION_DIR) -> None:
     _atomic_write_text(root, ROOT_TSX)
 
 
-def delete_project(name: str, remotion_dir: Path = REMOTION_DIR) -> list[str]:
+def project_input_files(name: str) -> list[Path]:
+    """The project's source videos that still exist AND live under input/. Reads the
+    manifest (raises FileNotFoundError if it's missing — a hard invariant). External
+    sources (referenced by absolute path outside input/) are deliberately excluded:
+    the delete feature only removes "resources at /input"."""
+    input_root = INPUT_DIR.resolve()
+    files: list[Path] = []
+    for raw in read_manifest(name).get("inputs", []):
+        try:
+            resolved = Path(raw).resolve()
+        except OSError:
+            continue
+        if resolved.exists() and input_root in resolved.parents:
+            files.append(resolved)
+    return files
+
+
+def project_output_files(name: str) -> list[Path]:
+    """The project's rendered outputs that still exist (from the manifest). Reads the
+    manifest (raises FileNotFoundError if it's missing)."""
+    files: list[Path] = []
+    for raw in read_manifest(name).get("outputs", []):
+        p = Path(raw)
+        if p.exists():
+            files.append(p.resolve())
+    return files
+
+
+def delete_project(name: str, remotion_dir: Path = REMOTION_DIR,
+                   delete_input: bool = False, delete_output: bool = False) -> list[str]:
     """Remove ALL of a project's files and regenerate Root.tsx. Idempotent — missing
-    pieces are skipped. Returns the list of removed paths. Wipes, for project <name>:
+    pieces are skipped. Returns the list of removed paths. Always wipes, for <name>:
       - src/data/<name>/                       (pipeline intermediates)
       - src/remotion/src/projects/<name>.json  (render-ready snapshot)
       - src/remotion/public/projects/<name>/   (edited.mp4 + overlay images)
-    Clears the active-project state file if it pointed at <name>."""
+    Clears the active-project state file if it pointed at <name>.
+
+    Optional cleanup of the SHARED staging folders (off by default so the CLI/native
+    delete keep source footage): delete_input unlinks the project's source video(s)
+    under input/, delete_output unlinks its rendered output(s). Both read the manifest
+    BEFORE the data dir is wiped (the manifest lives inside it)."""
     removed: list[str] = []
+
+    # Resolve manifest-backed files first — the data dir (which holds manifest.json)
+    # is wiped below, so this must happen before the rmtree.
+    input_files = project_input_files(name) if delete_input else []
+    output_files = project_output_files(name) if delete_output else []
 
     data_dir = DATA_ROOT / name
     if data_dir.exists():
@@ -257,6 +296,11 @@ def delete_project(name: str, remotion_dir: Path = REMOTION_DIR) -> list[str]:
 
     if STATE_FILE.exists() and STATE_FILE.read_text(encoding="utf-8").strip() == name:
         STATE_FILE.unlink()
+
+    for f in input_files + output_files:
+        if f.exists():
+            f.unlink()
+            removed.append(str(f))
 
     regenerate_root(remotion_dir)
     return removed

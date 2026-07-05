@@ -18,7 +18,7 @@ from pathlib import Path
 from config import (
     OUT_DIR, OUTPUT_DIR, REMOTION_DIR, IMAGES_DIR, ACTIVE_PROJECT,
     VIDEO_FPS, FFMPEG_AAC_STEREO_ARGS, SIDECAR_PORT, get_mode, run_ffmpeg,
-    seconds_to_frame, frames_to_ms,
+    seconds_to_frame, frames_to_ms, append_manifest_output,
 )
 from tuning import (
     MAX_WORDS_PER_CAPTION, MAX_CHARS_PER_CAPTION, MIN_CAPTION_DURATION_MS,
@@ -652,6 +652,7 @@ def main():
             ["npx", "remotion", "render", ACTIVE_PROJECT, str(final_out)],
             cwd=REMOTION_DIR, check=True
         )
+        append_manifest_output(final_out)
         print(f"\n🎬 Final video: {final_out}")
     else:
         print("\n  opening Remotion Studio for preview...")

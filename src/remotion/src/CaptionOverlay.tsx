@@ -12,13 +12,10 @@ import { activeCaptionIndex } from "./caption-utils";
 // Rendered subtitle follows the brand system: Outfit Bold uppercase, Cream
 // inactive words with Forest halo, active word in a Cream pill with Deep
 // Forest text + Gold outline ring + subtle scale pop.
-// Outfit is loaded the Remotion-recommended way (same as TitleCard): loadFont
-// handles delayRender/continueRender internally — no manual @import or
-// document.fonts dance, so it works offline and during a CLI render.
-const { fontFamily: BRAND_FONT } = loadFont("normal", {
-  weights: ["400", "600", "700"],
-  subsets: ["latin"],
-});
+// Outfit (Google Fonts) loads INSIDE CaptionPage below — only when a caption
+// actually renders. Youtube keeps captionsEnabled=false so CaptionOverlay never
+// mounts, this never runs, and the render makes no font request (offline-safe).
+// Reels DO fetch from fonts.gstatic.com and need network, by design.
 const BRAND_WORD = "#FAF5ED"; // Cream
 const BRAND_FOREST = "#1F3329"; // Deep Forest
 const BRAND_GOLD = "#D4A03A"; // Gold
@@ -33,6 +30,12 @@ const CaptionPage: React.FC<{
   captionIndex: number;
   isStudio: boolean;
 }> = ({ segment, currentMs, captionIndex, isStudio }) => {
+  // Loaded here (not at module scope) so youtube — which never mounts this —
+  // issues no network request. google-fonts dedupes, so per-frame calls are cheap.
+  const { fontFamily: BRAND_FONT } = loadFont("normal", {
+    weights: ["400", "600", "700"],
+    subsets: ["latin"],
+  });
   const { width, height } = useVideoConfig();
 
   // Click a caption on the video → ask the Studio Subtitles tab to open its

@@ -38,6 +38,7 @@ from config import (
     run_ffmpeg,
     call_claude,
     ms_to_s,
+    append_manifest_output,
 )
 
 
@@ -342,6 +343,7 @@ def main():
         print("  youtube mode — skipping motion graphics (reel-only).")
         OUTPUT_DIR.mkdir(exist_ok=True)
         shutil.copy2(edited_mp4, final_mp4)
+        append_manifest_output(final_mp4)
         print(f"  copied edited video → {final_mp4}")
         return
 
@@ -368,6 +370,7 @@ def main():
         print("  No graphics to render. Copying edited.mp4 → output/final.mp4.")
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         shutil.copy2(edited_mp4, final_mp4)
+        append_manifest_output(final_mp4)
         print(f"  {final_mp4}")
         return
 
@@ -384,6 +387,7 @@ def main():
         print("  Nothing to render. Copying edited.mp4 → output/final.mp4.")
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         shutil.copy2(edited_mp4, final_mp4)
+        append_manifest_output(final_mp4)
         print(f"  {final_mp4}")
         return
 
@@ -405,6 +409,7 @@ def main():
 
     # Composite
     composite(edited_mp4, overlay_webm, final_mp4)
+    append_manifest_output(final_mp4)
 
     print(f"\nDone. Final video: {final_mp4}")
     if image_plan:

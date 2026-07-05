@@ -37,7 +37,7 @@ from tuning import (
     CHUNK_EDGE_PAD, CHUNK_SILENCE_DB, CHUNK_SILENCE_MIN,
 )
 
-WHISPER_DIR = SRC_DIR.parent / "whisper.cpp"
+WHISPER_DIR = SRC_DIR / "whisper.cpp"
 TRANSCRIBE_SCRIPT = REMOTION_DIR / "scripts" / "transcribe.mjs"
 
 SENTENCE_END_RE = re.compile(r"[.!?…]+$")

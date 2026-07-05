@@ -97,6 +97,12 @@ FFMPEG_AAC_STEREO_ARGS = ["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", 
 # whisper.cpp accepts ONLY 16 kHz mono WAV — a format requirement, not a knob.
 WHISPER_SAMPLE_RATE = 16000
 
+# Voice-band pre-filter (~80-3000 Hz) applied before ANY loudness measurement, so
+# low rumble (AC/fridge/mic handling) and high hiss don't read as speech energy.
+# Shared by silencedetect and the step-1 noise-floor measurement — both MUST see
+# the same signal or their dB values aren't comparable.
+VOICE_BANDPASS = "highpass=f=80,lowpass=f=3000"
+
 # --- Image overlays ---
 IMAGES_DIR = INPUT_DIR / "images"
 IMAGE_WIDTH_FRAC = 0.35
@@ -171,13 +177,11 @@ def silencedetect(path: Path, noise_db: float, min_dur: float,
     the file ends mid-silence ffmpeg emits a trailing silence_start with no matching
     silence_end; when total_duration is given that unpaired start is closed at
     total_duration instead of being silently dropped by zip()."""
-    # Band-pass to the human-voice range (~80-3000 Hz) BEFORE measuring loudness, so
-    # low rumble (AC/fridge/mic handling) and high hiss don't keep a real pause above
-    # the noise threshold and get mistaken for speech. Detection-only: the actual
-    # audio/video is untouched, this filter just sharpens the pause-vs-speech call.
+    # Detection-only: the audio/video is untouched, VOICE_BANDPASS just sharpens
+    # the pause-vs-speech call.
     proc = run_ffmpeg(
         ["ffmpeg", "-i", str(path),
-         "-af", f"highpass=f=80,lowpass=f=3000,silencedetect=noise={noise_db}dB:d={min_dur}",
+         "-af", f"{VOICE_BANDPASS},silencedetect=noise={noise_db}dB:d={min_dur}",
          "-f", "null", "-"]
     )
     out = proc.stderr or ""
@@ -209,6 +213,58 @@ def call_claude(prompt: str, extra_args: Optional[list] = None, timeout: Optiona
         print(f"  WARNING: could not parse JSON response: {e}")
         print(f"  Raw: {raw[:300]}")
         return None
+
+
+# --- Per-project manifest (source inputs + rendered outputs) ---
+# manifest.json is the single source of truth mapping a project to the SHARED
+# input/ and output/ folders. It records the absolute paths of every source video
+# the project was built from (inputs) and every file it rendered (outputs).
+# Step 1 writes inputs at (re)creation; steps 4/5 append outputs; the delete and
+# re-run-pipeline features read it. Mandatory: every project must have one — its
+# absence means a project was created outside the pipeline (a real bug), so
+# read_manifest raises rather than degrading to a guess.
+
+def manifest_path(project: Optional[str] = None) -> Path:
+    """Path to a project's manifest.json (defaults to the active project)."""
+    name = project or ACTIVE_PROJECT
+    return DATA_ROOT / name / "manifest.json"
+
+
+def read_manifest(project: Optional[str] = None) -> dict:
+    """Read a project's manifest, with inputs/outputs always present as lists.
+    Raises FileNotFoundError if the manifest is missing (hard invariant)."""
+    p = manifest_path(project)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"manifest.json missing for project '{project or ACTIVE_PROJECT}': {p}")
+    data = json.loads(p.read_text(encoding="utf-8"))
+    data.setdefault("inputs", [])
+    data.setdefault("outputs", [])
+    return data
+
+
+def write_manifest_inputs(paths: list, project: Optional[str] = None) -> None:
+    """Write a fresh manifest: source inputs (absolute) recorded, outputs empty.
+    Called by step 1, so a new source set resets the record for a re-run."""
+    p = manifest_path(project)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"inputs": [str(Path(x).resolve()) for x in paths], "outputs": []}
+    p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def append_manifest_output(path: Path, project: Optional[str] = None) -> None:
+    """Append a rendered output path (absolute, deduped) to the manifest. Called by
+    step 4 (--render) and step 5. Tolerates a not-yet-written manifest."""
+    p = manifest_path(project)
+    try:
+        data = read_manifest(project)
+    except FileNotFoundError:
+        data = {"inputs": [], "outputs": []}
+    abs_path = str(Path(path).resolve())
+    if abs_path not in data["outputs"]:
+        data["outputs"].append(abs_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def seconds_to_frame(seconds: float, fps: int = VIDEO_FPS) -> int:

@@ -73,10 +73,34 @@ index 60b8033..2c07e5f 100644
  };
  exports.CompositionSelectorItem = CompositionSelectorItem;
 diff --git a/node_modules/@remotion/studio/dist/components/NewComposition/DeleteComposition.js b/node_modules/@remotion/studio/dist/components/NewComposition/DeleteComposition.js
-index c612cf4..e1e2194 100644
+index c612cf4..e43e226 100644
 --- a/node_modules/@remotion/studio/dist/components/NewComposition/DeleteComposition.js
 +++ b/node_modules/@remotion/studio/dist/components/NewComposition/DeleteComposition.js
-@@ -33,12 +33,11 @@ const DeleteCompositionLoaded = ({ compositionId }) => {
+@@ -9,6 +9,8 @@ const ModalHeader_1 = require("../ModalHeader");
+ const ResolveCompositionBeforeModal_1 = require("../RenderModal/ResolveCompositionBeforeModal");
+ const CodemodFooter_1 = require("./CodemodFooter");
+ const DismissableModal_1 = require("./DismissableModal");
++// video-editor patch: project-owned cleanup options (source/output deletion).
++const DeleteProjectOptions_1 = require("../../../../../../src/studio/DeleteProjectOptions");
+ const content = {
+     padding: 16,
+     fontSize: 14,
+@@ -23,22 +25,26 @@ const DeleteCompositionLoaded = ({ compositionId }) => {
+     }
+     const { unresolved } = context;
+     const compositionStack = (_a = unresolved.stack) !== null && _a !== void 0 ? _a : null;
++    // video-editor patch: which shared files to also delete (input/output).
++    const [choice, setChoice] = (0, react_1.useState)('none');
+     const codemod = (0, react_1.useMemo)(() => {
+         return {
+             type: 'delete-composition',
+             idToDelete: compositionId,
++            deleteInput: choice === 'all' || choice === 'input',
++            deleteOutput: choice === 'all' || choice === 'output',
+         };
+-    }, [compositionId]);
++    }, [compositionId, choice]);
+     const onSubmit = (0, react_1.useCallback)((e) => {
          e.preventDefault();
      }, []);
      return (jsx_runtime_1.jsxs(jsx_runtime_1.Fragment, { children: [
@@ -89,7 +113,8 @@ index c612cf4..e1e2194 100644
 -                            jsx_runtime_1.jsx("code", { style: styles_1.inlineCodeSnippet, children: "component" }),
 -                            " will remain in your code."] }), jsx_runtime_1.jsx(ModalFooter_1.ModalFooterContainer, { children: jsx_runtime_1.jsx(CodemodFooter_1.CodemodFooter, { errorNotification: `Could not delete composition`, loadingNotification: 'Deleting', successNotification: `Deleted ${unresolved.id}`, genericSubmitLabel: `Delete`, submitLabel: ({ relativeRootPath }) => `Delete from ${relativeRootPath}`, codemod: codemod, stack: compositionStack, valid: true, onSuccess: null }) })
 +                            jsx_runtime_1.jsx("br", {}),
-+                            "This permanently removes ALL of its files: pipeline data, Remotion snapshot, rendered video + images. This cannot be undone."] }), jsx_runtime_1.jsx(ModalFooter_1.ModalFooterContainer, { children: jsx_runtime_1.jsx(CodemodFooter_1.CodemodFooter, { errorNotification: `Could not delete project`, loadingNotification: 'Deleting', successNotification: `Deleted ${unresolved.id}`, genericSubmitLabel: `Delete project`, submitLabel: () => `Delete project`, codemod: codemod, stack: compositionStack, valid: true, onSuccess: null }) })
++                            "This permanently removes ALL of its files: pipeline data, Remotion snapshot, rendered video + images. This cannot be undone.",
++                            jsx_runtime_1.jsx(DeleteProjectOptions_1.DeleteProjectOptions, { project: compositionId, value: choice, onChange: setChoice })] }), jsx_runtime_1.jsx(ModalFooter_1.ModalFooterContainer, { children: jsx_runtime_1.jsx(CodemodFooter_1.CodemodFooter, { errorNotification: `Could not delete project`, loadingNotification: 'Deleting', successNotification: `Deleted ${unresolved.id}`, genericSubmitLabel: `Delete project`, submitLabel: () => `Delete project`, codemod: codemod, stack: compositionStack, valid: true, onSuccess: null }) })
                  ] })
          ] }));
  };

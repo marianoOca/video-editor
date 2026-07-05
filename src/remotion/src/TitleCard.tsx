@@ -14,14 +14,10 @@ import type { TitleCard as TitleCardData } from "./schema";
 // Top banner: Cream solid background, Italiana title (Deep Forest, one optional
 // word in Gold), Outfit pill subtitle. Fully rendered at frame 0, fades out at
 // the end. Single source of truth — tweak the look here, not per-video.
-const { fontFamily: italiana } = loadItaliana("normal", {
-  weights: ["400"],
-  subsets: ["latin"],
-});
-const { fontFamily: outfit } = loadOutfit("normal", {
-  weights: ["500", "700"],
-  subsets: ["latin"],
-});
+// Fonts (Google Fonts) load INSIDE TitleCardItem — only when a title card
+// actually renders. Youtube gets no title cards (4_render skips them for
+// mode==youtube), so nothing loads there and the render is offline-safe. A reel
+// with a title card fetches from fonts.gstatic.com and needs network, by design.
 
 const FADE_OUT_FRAMES = 20;
 
@@ -54,6 +50,16 @@ const TitleCardItem: React.FC<{
   subtitle: string;
   durationInFrames: number;
 }> = ({ title, titleHighlight, subtitle, durationInFrames }) => {
+  // Loaded here (not at module scope) so a video with no title card — every
+  // youtube render — makes no font request. google-fonts dedupes across frames.
+  const { fontFamily: italiana } = loadItaliana("normal", {
+    weights: ["400"],
+    subsets: ["latin"],
+  });
+  const { fontFamily: outfit } = loadOutfit("normal", {
+    weights: ["500", "700"],
+    subsets: ["latin"],
+  });
   const frame = useCurrentFrame();
 
   const outStart = durationInFrames - FADE_OUT_FRAMES;

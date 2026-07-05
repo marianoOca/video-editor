@@ -25,13 +25,19 @@ Output:
 
 import subprocess
 import json
+import re
 import sys
 import argparse
 from pathlib import Path
+from typing import Optional
 from config import (
     INPUT_DIR, OUT_DIR, MODE_PATH, probe, run_ffmpeg, list_videos,
-    REEL_W, REEL_H, YT_W, YT_H, VIDEO_FPS,
-    FFMPEG_X264_FAST_ARGS, FFMPEG_AAC_STEREO_ARGS,
+    REEL_W, REEL_H, YT_W, YT_H, VIDEO_FPS, VOICE_BANDPASS,
+    FFMPEG_X264_FAST_ARGS, FFMPEG_AAC_STEREO_ARGS, write_manifest_inputs,
+)
+from tuning import (
+    FLOOR_WINDOW_SEC, FLOOR_PERCENTILE, FLOOR_MARGIN_DB,
+    FLOOR_DB_MIN, FLOOR_DB_MAX,
 )
 
 
@@ -98,6 +104,34 @@ def normalize(video: Path, out: Path, target_w: int, target_h: int, data: dict) 
     print(f"  normalizing {video.name} (rotation={rotation}, {duration:.0f}s)...")
     subprocess.run(cmd, check=True)
     return duration
+
+
+def measure_silence_floor(path: Path) -> Optional[float]:
+    """Noise floor (dB) of the voice-band signal: the FLOOR_PERCENTILE of
+    windowed RMS. Uses the same VOICE_BANDPASS as config.silencedetect so the
+    dB values are comparable by construction. Windows of digital silence
+    (< -90 dB) are excluded — they are padding/mute, not room tone, and would
+    drag the floor to the clamp. Returns None when nothing usable was measured."""
+    data = probe(path)
+    astream = next((s for s in data["streams"] if s["codec_type"] == "audio"), None)
+    if astream is None:
+        return None
+    window = max(1, int(int(astream["sample_rate"]) * FLOOR_WINDOW_SEC))
+    proc = run_ffmpeg(
+        ["ffmpeg", "-i", str(path),
+         "-af", (f"{VOICE_BANDPASS},asetnsamples=n={window},"
+                 "astats=metadata=1:reset=1,"
+                 "ametadata=print:key=lavfi.astats.Overall.RMS_level"),
+         "-f", "null", "-"]
+    )
+    vals = [float(m) for m in
+            re.findall(r"RMS_level=(-?[\d.]+(?:[eE][+-]?\d+)?)", proc.stderr or "")]
+    vals = [v for v in vals if v > -90.0]
+    if not vals:
+        return None
+    vals.sort()
+    idx = min(len(vals) - 1, len(vals) * FLOOR_PERCENTILE // 100)
+    return vals[idx]
 
 
 def concatenate(norm_files: list[Path], out: Path):
@@ -209,6 +243,26 @@ def main():
     clip_map_path = OUT_DIR / "clip_map.json"
     with open(clip_map_path, "w") as f:
         json.dump(clip_map, f, indent=2)
+
+    # Record the exact source videos this project was built from. The manifest is
+    # the single source of truth for the project→input/ mapping (input/ is shared
+    # staging), used by the delete + re-run-pipeline features. A fresh --from 1 run
+    # resets it, so re-running step 1 records the current source set.
+    write_manifest_inputs([v.resolve() for v in videos])
+
+    # Adaptive silence threshold for step 3: measured noise floor + margin,
+    # clamped (knobs + rationale in tuning.py). Stored in mode.json; step 3
+    # falls back to the fixed SILENCE_DB when the field is absent.
+    floor = measure_silence_floor(combined)
+    if floor is not None:
+        cfg["silence_floor_db"] = round(floor, 2)
+        cfg["silence_db"] = round(
+            min(FLOOR_DB_MAX, max(FLOOR_DB_MIN, floor + FLOOR_MARGIN_DB)), 2)
+        print(f"  noise floor {cfg['silence_floor_db']} dB "
+              f"→ silence threshold {cfg['silence_db']} dB")
+    else:
+        print("  ⚠ noise-floor measurement failed — "
+              "step 3 will use the default SILENCE_DB")
 
     with open(MODE_PATH, "w") as f:
         json.dump(cfg, f, indent=2)
