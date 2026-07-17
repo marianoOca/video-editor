@@ -525,9 +525,34 @@ def remap_captions(prev_caps: list[dict], old_keep: list[dict],
     return out
 
 
+def render_final(output_name):
+    """Render the active project's EXISTING composition to output/<stem>.mp4.
+    Shared by --render (right after a fresh cut) and --render-only (composition
+    already built by a prior run / the full pipeline — no re-cut, no snapshot
+    rewrite). Reads whatever is in the snapshot, so image overlays and title cards
+    injected by later steps are included."""
+    print("\n  rendering final video with Remotion...")
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    # Default stem matches Studio's native Render default (regenerate_root sets
+    # defaultOutName = "<project>-edited"), so a CLI/auto render and a manual Studio
+    # render land on the same filename — and the delete convention-glob finds both.
+    stem = output_name if output_name else f"{ACTIVE_PROJECT}-edited"
+    final_out = OUTPUT_DIR / f"{stem}.mp4"
+    subprocess.run(
+        ["npx", "remotion", "render", ACTIVE_PROJECT, str(final_out)],
+        cwd=REMOTION_DIR, check=True
+    )
+    append_manifest_output(final_out)
+    print(f"\n🎬 Final video: {final_out}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--render", action="store_true", help="Render final MP4 instead of opening Studio")
+    parser.add_argument("--render-only", action="store_true",
+                        help="Render the EXISTING composition to output/<name>.mp4 and exit "
+                             "(no re-cut, no snapshot rewrite, no Studio). Used by run_all --render "
+                             "to render AFTER the full pipeline so image overlays are included.")
     parser.add_argument("--no-subtitles", action="store_true", help="Disable subtitles regardless of mode")
     parser.add_argument("--no-title", action="store_true", help="Disable title cards regardless of mode")
     parser.add_argument("--output-name", default=None,
@@ -543,6 +568,12 @@ def main():
                              "Studio (it's already running; HMR reloads). Used by the Subtitles-tab "
                              "Fix button to repair a corrupt project.")
     args = parser.parse_args()
+
+    # Render-only: the composition already exists (built by a prior run or the full
+    # pipeline). Skip cut + snapshot rewrite entirely — just render it.
+    if args.render_only:
+        render_final(args.output_name)
+        return
 
     edit_plan_path = OUT_DIR / "edit_plan.json"
     if not edit_plan_path.exists():
@@ -644,16 +675,7 @@ def main():
         return
 
     if args.render:
-        print("\n  rendering final video with Remotion...")
-        OUTPUT_DIR.mkdir(exist_ok=True)
-        stem = args.output_name if args.output_name else ACTIVE_PROJECT
-        final_out = OUTPUT_DIR / f"{stem}.mp4"
-        subprocess.run(
-            ["npx", "remotion", "render", ACTIVE_PROJECT, str(final_out)],
-            cwd=REMOTION_DIR, check=True
-        )
-        append_manifest_output(final_out)
-        print(f"\n🎬 Final video: {final_out}")
+        render_final(args.output_name)
     else:
         print("\n  opening Remotion Studio for preview...")
         print("  (Ctrl+C to stop, then run with --render to export)")

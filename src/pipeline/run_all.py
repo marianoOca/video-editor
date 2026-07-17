@@ -11,7 +11,7 @@ Steps:
 
 Usage:
   python3 run_all.py                    # full pipeline, opens Remotion Studio at the end
-  python3 run_all.py --render           # full pipeline, renders final MP4
+  python3 run_all.py --render           # full pipeline, then render output/<project>-edited.mp4 (after step 6)
   python3 run_all.py --from 2           # skip step 1, start from step 2
   python3 run_all.py --from 6           # only re-run motion graphics
   python3 run_all.py --mode reel        # force reel mode (vertical, subtitles ON)
@@ -60,10 +60,14 @@ def derive_project_name(args, input_dir: Path):
     return None
 
 
-def run_step(script: str, extra_args: Optional[list[str]] = None):
+def run_step(script: str, extra_args: Optional[list[str]] = None,
+             marker: Optional[str] = None):
+    """Run a pipeline step. `marker` overrides the "▶ <token>" progress line the
+    sidecar parses (defaults to the script name) — used so the final render step
+    reports as "render" rather than a second "4_render.py"."""
     extra_args = extra_args or []
     print(f"\n{'='*50}")
-    print(f"▶  {script}")
+    print(f"▶  {marker or script}")
     print(f"{'='*50}")
     result = subprocess.run(
         [sys.executable, str(PIPELINE / script), *extra_args]
@@ -125,21 +129,20 @@ def main():
     if args.no_images:
         motion_extra.append("--no-images")
 
-    render_extra = ["--render"] if args.render else []
+    # Step 4 only cuts + writes the snapshot here; the final Remotion render runs
+    # AFTER the whole pipeline (see below) so it captures the image overlays step 5
+    # (4b) injects. So step 4 never renders and must not open Studio in render mode.
+    render_extra = []
     if args.no_subtitles:
         render_extra.append("--no-subtitles")
     if args.no_title:
         render_extra.append("--no-title")
-    # --no-open only matters in the non-render path (--render never opens Studio).
-    if args.no_open and not args.render:
+    if args.no_open or args.render:
         render_extra.append("--no-open")
 
     normalize_extra = ["--mode", args.mode] if args.mode else []
     if args.input:
         normalize_extra += ["--input", *args.input]
-
-    if args.output_name:
-        render_extra += ["--output-name", args.output_name]
 
     steps = [
         (1, "1_normalize.py", normalize_extra),
@@ -162,6 +165,16 @@ def main():
                 print(f"\n⏭  Skipping {script} (youtube mode — overlays are reel-only)")
                 continue
         run_step(script, extra)
+
+    # Final render LAST — after motion graphics — so the rendered MP4 includes the
+    # image overlays/title cards injected by steps 4b/5. --render-only skips a
+    # re-cut; it just renders the composition the pipeline just built. Marked
+    # "render" so the sidecar shows a distinct "Rendering" step (not a 2nd step 4).
+    if args.render:
+        render_only_extra = ["--render-only"]
+        if args.output_name:
+            render_only_extra += ["--output-name", args.output_name]
+        run_step("4_render.py", render_only_extra, marker="render")
 
     print("\n🎬 Pipeline complete.")
 

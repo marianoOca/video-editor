@@ -42,8 +42,9 @@ Endpoints (CORS-open for localhost Studio on :3000):
     GET  /input-videos    -> {videos:[{name,sizeMB}], projects:[...], hyperframesUp}
     POST /upload-video?filename=<n>  raw body -> stream a dropped video into input/
     POST /import-path     body {"path": "/abs/video.mp4"} -> reference it in place
-    POST /run-pipeline    body {"inputs":[...], "project", "overwrite"?}
-                      -> enqueue run_all.py 1-6 as a background job; {"jobId"}
+    POST /run-pipeline    body {"inputs":[...], "project", "overwrite"?, "render"?}
+                      -> enqueue run_all.py 1-6 as a background job; render=true adds
+                         a final render step (output/<project>.mp4); {"jobId"}
     POST /rerun-pipeline  body {"project", "fromStep": 2}
                       -> enqueue a re-run from step N (run_all --from N); {"jobId"}.
                          Step 1 rebuilds from the project's manifest sources.
@@ -112,7 +113,8 @@ _RUNNING: dict | None = None                      # job currently executing
 _JOBS: "OrderedDict[str, dict]" = OrderedDict()   # every non-evicted job, by id
 _DONE_TTL = 6.0                                    # seconds a finished job lingers
 _TOTAL_STEPS = 6
-# run_all.py prints "▶  <script>" at each step boundary (see its run_step()).
+# run_all.py prints "▶  <token>" at each step boundary (see its run_step()). The
+# token is the script name, except the optional final render step emits "render".
 _STEP_LABELS = {
     "1_normalize.py": (1, "Normalizing"),
     "2_transcribe.py": (2, "Transcribing"),
@@ -120,8 +122,11 @@ _STEP_LABELS = {
     "4_render.py": (4, "Cutting + preview"),
     "4b_place_images.py": (5, "Placing images"),
     "5_motion_graphics.py": (6, "Motion graphics"),
+    "render": (7, "Rendering"),
 }
-_STEP_RE = re.compile(r"^▶\s+(\S+\.py)")
+# Any non-space token; the `in _STEP_LABELS` guard ignores unrelated ▶ lines
+# (e.g. run_all's "▶ project: <name>").
+_STEP_RE = re.compile(r"^▶\s+(\S+)")
 
 
 def _port_open(port: int, host: str = "127.0.0.1", timeout: float = 0.2) -> bool:
@@ -505,9 +510,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"ok": False, "error": reason})
 
     def _project_files(self, project: str) -> None:
-        """Report a project's SHARED source + rendered files (from the manifest), so
-        the Delete modal can enable/disable its cleanup options. GET, read-only.
-        Returns basenames + an `exists` flag for each of input/output."""
+        """Report a project's SHARED source + rendered files, so the Delete modal can
+        enable/disable its cleanup options. GET, read-only. Returns basenames + an
+        `exists` flag for each of input/output. Outputs come from the manifest AND a
+        naming-convention glob (project_output_files), so a Studio-rendered file —
+        never recorded in the manifest — is still offered for deletion; a legacy
+        project with no manifest still reports its outputs."""
         project = (project or "").strip()
         if not PROJECT_RE.match(project):
             self._json(400, {"ok": False, "error": "invalid project name"})
@@ -515,9 +523,6 @@ class Handler(BaseHTTPRequestHandler):
         try:
             inputs = project_input_files(project)
             outputs = project_output_files(project)
-        except FileNotFoundError as e:  # manifest missing — invariant break
-            self._json(404, {"ok": False, "error": str(e)})
-            return
         except Exception as e:
             self._json(500, {"ok": False, "error": str(e)})
             return
@@ -710,6 +715,7 @@ class Handler(BaseHTTPRequestHandler):
             if not PROJECT_RE.match(project):
                 raise ValueError("invalid project name")
             overwrite = bool(data.get("overwrite", False))
+            render = bool(data.get("render", False))
         except (ValueError, TypeError, json.JSONDecodeError) as e:
             self._json(400, {"ok": False, "error": str(e)})
             return
@@ -721,7 +727,12 @@ class Handler(BaseHTTPRequestHandler):
         cmd = [sys.executable, "run_all.py",
                "--from", "1", "--until", "6", "--no-open",
                "--project", project, "--input", *inputs]
-        job = _enqueue(cmd, project, "new")
+        # "Create & render": run the pipeline, then render output/<project>.mp4 as a
+        # final step (step 7 in the progress bar). --render + --no-open coexist:
+        # step 4 writes the snapshot without opening Studio, the render runs at the end.
+        if render:
+            cmd.append("--render")
+        job = _enqueue(cmd, project, "new", total=7 if render else _TOTAL_STEPS)
         if job is None:  # this project already has a queued/running job
             self._json(409, {"ok": False,
                              "error": "this project already has a job queued or running"})

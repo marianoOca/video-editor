@@ -34,6 +34,7 @@ from config import (
     INPUT_DIR, OUT_DIR, MODE_PATH, probe, run_ffmpeg, list_videos,
     REEL_W, REEL_H, YT_W, YT_H, VIDEO_FPS, VOICE_BANDPASS,
     FFMPEG_X264_FAST_ARGS, FFMPEG_AAC_STEREO_ARGS, write_manifest_inputs,
+    _store_path,
 )
 from tuning import (
     FLOOR_WINDOW_SEC, FLOOR_PERCENTILE, FLOOR_MARGIN_DB,
@@ -139,10 +140,13 @@ def concatenate(norm_files: list[Path], out: Path):
     list_file = OUT_DIR / "concat_list.txt"
     with open(list_file, "w") as f:
         for p in norm_files:
-            # The concat demuxer requires apostrophes inside a quoted path to be
-            # escaped as '\'' — an unescaped one ("Mariano's Files") misparses and
-            # kills the run after all the slow per-clip re-encodes.
-            quoted = str(p.resolve()).replace("'", "'\\''")
+            # Basename only: the concat demuxer resolves a relative entry against the
+            # LIST FILE's directory, which is OUT_DIR — exactly where the norm clips
+            # live — so this stays valid after the whole folder is moved (an absolute
+            # path would not). The apostrophe inside a quoted entry must be escaped as
+            # '\'' — an unescaped one ("Mariano's Files") misparses and kills the run
+            # after all the slow per-clip re-encodes.
+            quoted = p.name.replace("'", "'\\''")
             f.write(f"file '{quoted}'\n")
 
     cmd = [
@@ -209,7 +213,7 @@ def main():
         duration = normalize(video, combined, target_w, target_h, probes[video])
         clip_map = [{
             "name": video.name,
-            "norm_path": str(combined),
+            "norm_path": _store_path(combined),
             "start_sec": 0.0,
             "duration_sec": duration,
         }]
@@ -231,7 +235,7 @@ def main():
             duration = normalize(video, norm_path, target_w, target_h, probes[video])
             clip_map.append({
                 "name": video.name,
-                "norm_path": str(norm_path),
+                "norm_path": _store_path(norm_path),
                 "start_sec": cursor,
                 "duration_sec": duration,
             })

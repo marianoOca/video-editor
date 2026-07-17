@@ -217,8 +217,12 @@ def call_claude(prompt: str, extra_args: Optional[list] = None, timeout: Optiona
 
 # --- Per-project manifest (source inputs + rendered outputs) ---
 # manifest.json is the single source of truth mapping a project to the SHARED
-# input/ and output/ folders. It records the absolute paths of every source video
-# the project was built from (inputs) and every file it rendered (outputs).
+# input/ and output/ folders. It records every source video the project was built
+# from (inputs) and every file it rendered (outputs). Paths INSIDE the project
+# folder are stored RELATIVE to REPO_ROOT so the whole folder can be moved/renamed
+# without breaking them; genuinely external sources (an --import-path reference
+# outside the folder) stay absolute. read_manifest rehydrates every entry back to
+# an absolute path against the current folder location, so consumers are unchanged.
 # Step 1 writes inputs at (re)creation; steps 4/5 append outputs; the delete and
 # re-run-pipeline features read it. Mandatory: every project must have one — its
 # absence means a project was created outside the pipeline (a real bug), so
@@ -230,6 +234,30 @@ def manifest_path(project: Optional[str] = None) -> Path:
     return DATA_ROOT / name / "manifest.json"
 
 
+def _store_path(p) -> str:
+    """Serialize a path for the manifest. A path inside the project folder is stored
+    RELATIVE to REPO_ROOT so it survives moving the whole folder; a genuinely external
+    source (outside the folder, e.g. an --import-path reference) stays absolute."""
+    ap = Path(p).resolve()
+    try:
+        return str(ap.relative_to(REPO_ROOT.resolve()))
+    except ValueError:
+        return str(ap)
+
+
+def _load_path(s: str) -> Path:
+    """Rehydrate a stored manifest path against the CURRENT folder location. A relative
+    entry rejoins REPO_ROOT. A stale absolute entry from a previous location (written
+    before this scheme, or by a copy at a different path) self-heals to
+    INPUT_DIR/<basename> when that file exists, so old manifests keep working post-move."""
+    p = Path(s)
+    if not p.is_absolute():
+        return REPO_ROOT / p
+    if not p.exists() and (INPUT_DIR / p.name).exists():
+        return INPUT_DIR / p.name
+    return p
+
+
 def read_manifest(project: Optional[str] = None) -> dict:
     """Read a project's manifest, with inputs/outputs always present as lists.
     Raises FileNotFoundError if the manifest is missing (hard invariant)."""
@@ -238,8 +266,8 @@ def read_manifest(project: Optional[str] = None) -> dict:
         raise FileNotFoundError(
             f"manifest.json missing for project '{project or ACTIVE_PROJECT}': {p}")
     data = json.loads(p.read_text(encoding="utf-8"))
-    data.setdefault("inputs", [])
-    data.setdefault("outputs", [])
+    data["inputs"] = [str(_load_path(s)) for s in data.get("inputs", [])]
+    data["outputs"] = [str(_load_path(s)) for s in data.get("outputs", [])]
     return data
 
 
@@ -248,7 +276,7 @@ def write_manifest_inputs(paths: list, project: Optional[str] = None) -> None:
     Called by step 1, so a new source set resets the record for a re-run."""
     p = manifest_path(project)
     p.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"inputs": [str(Path(x).resolve()) for x in paths], "outputs": []}
+    payload = {"inputs": [_store_path(x) for x in paths], "outputs": []}
     p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -263,8 +291,14 @@ def append_manifest_output(path: Path, project: Optional[str] = None) -> None:
     abs_path = str(Path(path).resolve())
     if abs_path not in data["outputs"]:
         data["outputs"].append(abs_path)
+    # Re-serialize to storage form (relative-inside-folder), which also opportunistically
+    # migrates any legacy absolute inputs read above to the move-safe scheme.
+    payload = {
+        "inputs": [_store_path(x) for x in data["inputs"]],
+        "outputs": [_store_path(x) for x in data["outputs"]],
+    }
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def seconds_to_frame(seconds: float, fps: int = VIDEO_FPS) -> int:

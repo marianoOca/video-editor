@@ -21,7 +21,7 @@ import os
 import shutil
 from pathlib import Path
 
-from config import REMOTION_DIR, DATA_ROOT, STATE_FILE, INPUT_DIR, read_manifest
+from config import REMOTION_DIR, DATA_ROOT, STATE_FILE, INPUT_DIR, OUTPUT_DIR, read_manifest
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -233,12 +233,17 @@ def regenerate_root(remotion_dir: Path = REMOTION_DIR) -> None:
 
 def project_input_files(name: str) -> list[Path]:
     """The project's source videos that still exist AND live under input/. Reads the
-    manifest (raises FileNotFoundError if it's missing — a hard invariant). External
+    manifest; a legacy project with NO manifest yields [] (its sources aren't
+    name-derivable, so the delete feature simply can't offer input cleanup). External
     sources (referenced by absolute path outside input/) are deliberately excluded:
     the delete feature only removes "resources at /input"."""
     input_root = INPUT_DIR.resolve()
     files: list[Path] = []
-    for raw in read_manifest(name).get("inputs", []):
+    try:
+        raws = read_manifest(name).get("inputs", [])
+    except FileNotFoundError:
+        return files
+    for raw in raws:
         try:
             resolved = Path(raw).resolve()
         except OSError:
@@ -249,13 +254,34 @@ def project_input_files(name: str) -> list[Path]:
 
 
 def project_output_files(name: str) -> list[Path]:
-    """The project's rendered outputs that still exist (from the manifest). Reads the
-    manifest (raises FileNotFoundError if it's missing)."""
+    """The project's rendered outputs that still exist, deduped, from TWO sources so a
+    render is caught however it was produced:
+      1. the manifest's recorded outputs — CLI/auto renders (4_render --render) and the
+         shared output/final.mp4 (any filename). Tolerates a missing manifest.
+      2. the naming convention output/<name>.mp4 and output/<name>-*.mp4 — catches
+         Studio's NATIVE Render (defaultOutName "<name>-edited"), which is triggered in
+         the browser, never touches Python, and so is never in the manifest.
+    So delete finds the rendered file regardless of the manifest or the exact name."""
+    seen: set[Path] = set()
     files: list[Path] = []
-    for raw in read_manifest(name).get("outputs", []):
-        p = Path(raw)
-        if p.exists():
-            files.append(p.resolve())
+
+    def _add(p: Path) -> None:
+        rp = p.resolve()
+        if rp.exists() and rp not in seen:
+            seen.add(rp)
+            files.append(rp)
+
+    try:
+        for raw in read_manifest(name).get("outputs", []):
+            _add(Path(raw))
+    except FileNotFoundError:
+        pass
+    # EXACT filenames only — never a "<name>-*.mp4" glob, which would let project
+    # "clip" delete sibling "clip-2"'s output. "<name>-edited.mp4" is Studio's
+    # defaultOutName (+ our CLI default); "<name>.mp4" catches legacy bare renders.
+    # Custom --output-name renders aren't matched here but ARE in the manifest above.
+    for candidate in (OUTPUT_DIR / f"{name}.mp4", OUTPUT_DIR / f"{name}-edited.mp4"):
+        _add(candidate)
     return files
 
 

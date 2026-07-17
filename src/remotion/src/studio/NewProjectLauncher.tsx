@@ -6,7 +6,9 @@ import { Internals } from "remotion";
 // we render our own position:fixed overlay) that stages videos into input/ three
 // ways — drop (XHR upload), paste a local path (referenced in place, no copy), or
 // pick from input/ — then kicks off run_all.py 1-6 as a background job via the
-// sidecar.
+// sidecar. Two submit buttons: "Create project" (pipeline only) and "Create &
+// render" (also renders output/<project>-edited.mp4 as a final step, so no manual Studio
+// render is needed) — the only difference is the `render` flag in the POST body.
 //
 // The pipeline run is NON-BLOCKING and its progress lives IN THE COMPOSITION LIST,
 // not in the modal: clicking Create closes the modal immediately and the build is
@@ -715,14 +717,16 @@ const Modal: React.FC<{
     setPathInput("");
   }, [pathInput]);
 
-  const create = useCallback(async () => {
+  // render=true also renders output/<project>-edited.mp4 as a final step, right after the
+  // pipeline finishes — so there's no manual Studio render afterwards.
+  const create = useCallback(async (render: boolean) => {
     if (!checkedItems.length || !projectName || (collision && !overwrite)) return;
     setError(null);
     const inputs = checkedItems.map((i) => i.send);
     const { ok, status, body } = await fetchJSON("/run-pipeline", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ inputs, project: projectName, overwrite }),
+      body: JSON.stringify({ inputs, project: projectName, overwrite, render }),
     });
     if (!ok) {
       if (status === 409 && body.error === "project exists") {
@@ -911,8 +915,20 @@ const Modal: React.FC<{
           <button onClick={() => !busy && onClose()} style={btn(false)} disabled={busy}>
             Cancel
           </button>
-          <button onClick={create} style={{ ...btn(true), opacity: createDisabled ? 0.5 : 1 }} disabled={createDisabled}>
+          <button
+            onClick={() => create(false)}
+            style={{ ...btn(false), opacity: createDisabled ? 0.5 : 1 }}
+            disabled={createDisabled}
+          >
             {collision && overwrite ? "Overwrite & Create" : "Create project"}
+          </button>
+          <button
+            onClick={() => create(true)}
+            style={{ ...btn(true), opacity: createDisabled ? 0.5 : 1 }}
+            disabled={createDisabled}
+            title="Run the full pipeline, then render output/<project>-edited.mp4 automatically"
+          >
+            {collision && overwrite ? "Overwrite & Render" : "Create & render"}
           </button>
         </div>
       </div>
